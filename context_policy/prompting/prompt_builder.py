@@ -1,55 +1,14 @@
 """Prompt construction for patch generation."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-# Directories to ignore when building directory tree
-IGNORE_DIRS = {
-    ".git",
-    ".hg",
-    ".svn",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".tox",
-    ".nox",
-    ".eggs",
-    "*.egg-info",
-    "node_modules",
-    "venv",
-    ".venv",
-    "env",
-    ".env",
-    "dist",
-    "build",
-    "_build",
-    ".build",
-    "htmlcov",
-    ".coverage",
-    ".cache",
-}
-
-# File patterns to ignore
-IGNORE_FILES = {
-    ".DS_Store",
-    "Thumbs.db",
-    "*.pyc",
-    "*.pyo",
-    "*.so",
-    "*.egg",
-}
+from context_policy.utils.ignore import should_ignore_dir, should_ignore_file
 
 
 def _should_ignore(name: str) -> bool:
     """Check if a file/directory name should be ignored."""
-    if name in IGNORE_DIRS or name in IGNORE_FILES:
-        return True
-    # Check wildcard patterns
-    for pattern in IGNORE_DIRS | IGNORE_FILES:
-        if pattern.startswith("*") and name.endswith(pattern[1:]):
-            return True
-    return False
+    return should_ignore_dir(name) or should_ignore_file(name)
 
 
 def _build_tree(repo_dir: Path, max_depth: int = 2) -> str:

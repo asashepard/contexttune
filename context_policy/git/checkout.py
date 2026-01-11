@@ -4,9 +4,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-# Base directories for git caching
-REPOS_CACHE_DIR = Path("artifacts/repos_cache")
-WORKTREES_DIR = Path("artifacts/worktrees")
+# Base directories for git caching (resolved to absolute)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+REPOS_CACHE_DIR = _PROJECT_ROOT / "artifacts" / "repos_cache"
+WORKTREES_DIR = _PROJECT_ROOT / "artifacts" / "worktrees"
 
 
 def _run_git(args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:

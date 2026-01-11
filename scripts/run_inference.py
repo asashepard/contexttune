@@ -126,6 +126,11 @@ def main() -> None:
         default=120,
         help="Request timeout in seconds (default: 120).",
     )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Skip model calls; emit empty patches. Useful for plumbing validation.",
+    )
 
     args = parser.parse_args()
 
@@ -192,16 +197,19 @@ def main() -> None:
                 context_md = None  # Empty string -> None
 
         try:
-            # Generate patch
-            patch = generate_patch(
-                instance=instance,
-                model=args.model,
-                context_md=context_md,
-                temperature=0.0,
-                top_p=1.0,
-                max_tokens=args.max_tokens,
-                timeout_s=args.timeout_s,
-            )
+            # Generate patch (or placeholder in dry-run mode)
+            if args.dry_run:
+                patch = ""  # Empty patch for plumbing validation
+            else:
+                patch = generate_patch(
+                    instance=instance,
+                    model=args.model,
+                    context_md=context_md,
+                    temperature=0.0,
+                    top_p=1.0,
+                    max_tokens=args.max_tokens,
+                    timeout_s=args.timeout_s,
+                )
 
             # Build prediction record
             record = {

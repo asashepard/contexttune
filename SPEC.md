@@ -17,6 +17,7 @@ artifacts/logs/<run_id>/<instance_id>.log  # Per-instance debug logs
 artifacts/repos_cache/<repo>.git       # Bare git mirrors
 artifacts/worktrees/<repo>/<commit>/   # Git worktrees (checked out repos)
 artifacts/contexts/<repo>/<commit>/context.md  # Pre-generated context (Step 5)
+artifacts/signals/<repo>/<commit>/signals.json  # Extracted repo signals (Step 4)
 results/<run_id>/                       # Evaluation outputs
   ├── results.json
   ├── instance_results.jsonl
@@ -34,6 +35,18 @@ rm -rf artifacts/repos_cache artifacts/worktrees
 
 Worktrees are not auto-pruned. Delete manually when disk space is needed.
 
+To reset signals:
+```bash
+rm -rf artifacts/signals
+```
+
+## Determinism Rules
+
+- **Sorted lists**: All list outputs are sorted alphabetically.
+- **Normalized paths**: Use `/` separator, relative to repo root.
+- **No timestamps**: `signals.json` excludes `generated_at` for byte-identical reruns.
+- **No randomness**: No random suffixes or UUIDs in deterministic outputs.
+
 ## Run ID Format
 
 - Pattern: `<prefix>_<YYYYmmdd_HHMMSS>_<4-char-hex>`
@@ -42,7 +55,7 @@ Worktrees are not auto-pruned. Delete manually when disk space is needed.
 
 ## Code Conventions
 
-- **Python version**: 3.10+
+- **Python version**: 3.11+ (required for `tomllib`)
 - **Dependencies**: Standard library only for core utils (no external deps).
 - **Type hints**: Required for all function signatures.
 - **Imports**: `from __future__ import annotations` at top of each module.
@@ -85,4 +98,5 @@ Minimal, pinned in `requirements.txt`:
 
 - [x] Harness sanity check + dummy prediction writer
 - [x] Minimal single-shot inference runner (Step 3)
+- [x] Repo signals extraction (Step 4)
 - [ ] Context policy implementation (Step 5)

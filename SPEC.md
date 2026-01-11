@@ -2,6 +2,13 @@
 
 > **Keep this file updated** as the project evolves.
 
+## Execution Environment
+
+- **Primary**: WSL2 / Linux (Ubuntu recommended)
+- **Why**: SWE-bench harness uses Docker, git worktrees, bash scripts
+- **Windows**: Use WSL2. Native Windows adds complexity (path handling, subprocess).
+- **Project path in WSL**: `/mnt/c/code/contexttune` or clone to `~/code/contexttune`
+
 ## Directory Conventions
 
 ```
@@ -40,6 +47,26 @@ results/<run_id>/                       # Evaluation outputs
 - Do NOT modify SWE-bench harness code.
 - Call via `python -m swebench.harness.run_evaluation`.
 - Default dataset: `princeton-nlp/SWE-bench_Verified`.
+
+## Model Inference Interface (Thin Waist)
+
+All model inference uses **OpenAI-compatible HTTP API**:
+
+```bash
+export OPENAI_BASE_URL="http://localhost:8000/v1"  # or https://api.openai.com/v1
+export OPENAI_API_KEY="sk-..."                      # dummy ok for local
+```
+
+- Standardizes against any serving stack (vLLM, Ollama, OpenAI, Anthropic-via-proxy).
+- Use `requests` library, no vendor SDKs needed.
+- Endpoint: `POST /chat/completions` with standard OpenAI schema.
+
+## Dependencies
+
+Minimal, pinned in `requirements.txt`:
+- `swebench` — harness
+- `requests` — HTTP client
+- `datasets` — HuggingFace dataset loading
 
 ## Current Status
 

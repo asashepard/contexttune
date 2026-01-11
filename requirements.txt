@@ -1,0 +1,9 @@
+# Core dependencies - keep minimal
+# SWE-bench harness
+swebench>=2.0.0
+
+# HTTP client for OpenAI-compatible inference
+requests>=2.31.0
+
+# HuggingFace datasets for loading SWE-bench instances
+datasets>=2.14.0

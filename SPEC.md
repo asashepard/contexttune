@@ -14,10 +14,11 @@
 ```
 artifacts/preds/<run_id>/preds.jsonl   # Prediction files
 artifacts/logs/<run_id>/<instance_id>.log  # Per-instance debug logs
-artifacts/repos_cache/<repo>.git       # Bare git mirrors
-artifacts/worktrees/<repo>/<commit>/   # Git worktrees (checked out repos)
-artifacts/contexts/<repo>/<commit>/context.md  # Pre-generated context (Step 5)
-artifacts/signals/<repo>/<commit>/signals.json  # Extracted repo signals (Step 4)
+artifacts/repos_cache/<repo_dirname>.git   # Bare git mirrors
+artifacts/worktrees/<repo_dirname>/<commit>/  # Git worktrees (checked out repos)
+artifacts/signals/<repo_dirname>/<commit>/signals.json  # Repo signals (Step 4)
+artifacts/contexts/<repo_dirname>/<commit>/context.json  # Structured context
+artifacts/contexts/<repo_dirname>/<commit>/context.md    # Rendered context (Step 5)
 results/<run_id>/                       # Evaluation outputs
   ├── results.json
   ├── instance_results.jsonl
@@ -25,6 +26,8 @@ results/<run_id>/                       # Evaluation outputs
   ├── stdout.log
   └── stderr.log
 ```
+
+**repo_dirname**: Always `repo.replace("/", "__")` (e.g., `astropy/astropy` → `astropy__astropy`).
 
 ### Cleanup
 
@@ -51,8 +54,17 @@ rm -rf artifacts/signals
 ## Context Budget
 
 - **Unit**: Characters (approx tokens via `chars // 4`).
-- **Total context body**: ~3200 chars max (~800 tokens).
+- **Total context body**: 3200 chars max (~800 tokens).
+- **Per-card budget**: 900 chars max.
 - **No tokenizer dependency**: Simpler, deterministic.
+
+### Context Cards (Fixed Order)
+
+1. `repo_identity` — Repository metadata, primary packages
+2. `tests_howto` — Test commands, directories
+3. `editing_norms` — Global editing guidelines (constant)
+4. `routing_guidance` — Hot paths, module prefixes, entrypoints
+5. `pitfalls` — Warnings about layout quirks
 
 ## Run ID Format
 
@@ -106,4 +118,5 @@ Minimal, pinned in `requirements.txt`:
 - [x] Harness sanity check + dummy prediction writer
 - [x] Minimal single-shot inference runner (Step 3)
 - [x] Repo signals extraction (Step 4)
-- [ ] Context policy implementation (Step 5)
+- [x] Baseline context generation (Step 5)
+- [ ] Pipeline orchestration (Step 6)

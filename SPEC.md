@@ -13,6 +13,10 @@
 
 ```
 artifacts/preds/<run_id>/preds.jsonl   # Prediction files
+artifacts/logs/<run_id>/<instance_id>.log  # Per-instance debug logs
+artifacts/repos_cache/<repo>.git       # Bare git mirrors
+artifacts/worktrees/<repo>/<commit>/   # Git worktrees (checked out repos)
+artifacts/contexts/<repo>/<commit>/context.md  # Pre-generated context (Step 5)
 results/<run_id>/                       # Evaluation outputs
   ├── results.json
   ├── instance_results.jsonl
@@ -20,6 +24,15 @@ results/<run_id>/                       # Evaluation outputs
   ├── stdout.log
   └── stderr.log
 ```
+
+### Cleanup
+
+To reset git cache and worktrees:
+```bash
+rm -rf artifacts/repos_cache artifacts/worktrees
+```
+
+Worktrees are not auto-pruned. Delete manually when disk space is needed.
 
 ## Run ID Format
 
@@ -71,5 +84,5 @@ Minimal, pinned in `requirements.txt`:
 ## Current Status
 
 - [x] Harness sanity check + dummy prediction writer
-- [ ] Model inference integration
-- [ ] Context policy implementation
+- [x] Minimal single-shot inference runner (Step 3)
+- [ ] Context policy implementation (Step 5)

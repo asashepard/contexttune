@@ -44,8 +44,15 @@ rm -rf artifacts/signals
 
 - **Sorted lists**: All list outputs are sorted alphabetically.
 - **Normalized paths**: Use `/` separator, relative to repo root.
-- **No timestamps**: `signals.json` excludes `generated_at` for byte-identical reruns.
+- **No timestamps**: `signals.json` and `context.md` exclude timestamps for byte-identical reruns.
 - **No randomness**: No random suffixes or UUIDs in deterministic outputs.
+- **Repo dirname**: Always use `repo.replace("/", "__")` for filesystem paths (e.g., `astropy/astropy` → `astropy__astropy`).
+
+## Context Budget
+
+- **Unit**: Characters (approx tokens via `chars // 4`).
+- **Total context body**: ~3200 chars max (~800 tokens).
+- **No tokenizer dependency**: Simpler, deterministic.
 
 ## Run ID Format
 

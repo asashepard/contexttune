@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from context_policy.datasets.swebench import load_instances, read_instance_ids
 from context_policy.runner.single_shot import generate_patch
 from context_policy.utils.jsonl import read_jsonl
+from context_policy.utils.paths import CONTEXTS_DIR, LOGS_DIR, PREDS_DIR, get_context_path
 from context_policy.utils.run_id import make_run_id
 
 
@@ -52,8 +53,11 @@ def write_instance_log(
 
 def load_context(contexts_root: Path, repo: str, commit: str) -> str:
     """Load context file if it exists."""
-    safe_repo = repo.replace("/", "__")
-    context_path = contexts_root / safe_repo / commit / "context.md"
+    context_path = get_context_path(repo, commit)
+    # Allow override via contexts_root if different from default
+    if contexts_root != CONTEXTS_DIR:
+        from context_policy.utils.paths import repo_to_dirname
+        context_path = contexts_root / repo_to_dirname(repo) / commit / "context.md"
     if context_path.exists():
         return context_path.read_text(encoding="utf-8")
     return ""

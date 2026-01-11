@@ -12,10 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from context_policy.datasets.swebench import load_instances, read_instance_ids
 from context_policy.git.checkout import checkout_repo
 from context_policy.signals.build import build_signals, write_signals
-
-# Signals output directory (absolute)
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SIGNALS_DIR = _PROJECT_ROOT / "artifacts" / "signals"
+from context_policy.utils.paths import PROJECT_ROOT, get_signals_path
 
 
 def main() -> None:
@@ -74,8 +71,7 @@ def main() -> None:
         commit = instance["base_commit"]
 
         # Output path
-        safe_repo = repo.replace("/", "__")
-        out_path = SIGNALS_DIR / safe_repo / commit / "signals.json"
+        out_path = get_signals_path(repo, commit)
 
         # Skip if exists (unless --force)
         if out_path.exists() and not args.force:
@@ -97,7 +93,7 @@ def main() -> None:
             # Summary stats
             n_modules = len(signals["py_index"]["modules"])
             n_edges = len(signals["import_graph"]["edges"])
-            print(f"  -> wrote {out_path.relative_to(_PROJECT_ROOT)}")
+            print(f"  -> wrote {out_path.relative_to(PROJECT_ROOT)}")
             print(f"     modules={n_modules}, edges={n_edges}, hot_paths={len(signals['hot_paths'])}")
 
         except Exception as e:

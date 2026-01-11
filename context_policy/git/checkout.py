@@ -4,10 +4,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-# Base directories for git caching (resolved to absolute)
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-REPOS_CACHE_DIR = _PROJECT_ROOT / "artifacts" / "repos_cache"
-WORKTREES_DIR = _PROJECT_ROOT / "artifacts" / "worktrees"
+from context_policy.utils.paths import REPOS_CACHE_DIR, WORKTREES_DIR, repo_to_dirname
 
 
 def _run_git(args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -54,9 +51,7 @@ def _ensure_bare_mirror(repo: str) -> Path:
     Returns:
         Path to the bare mirror directory.
     """
-    # Sanitize repo name for filesystem (replace / with __)
-    safe_name = repo.replace("/", "__")
-    mirror_path = REPOS_CACHE_DIR / f"{safe_name}.git"
+    mirror_path = REPOS_CACHE_DIR / f"{repo_to_dirname(repo)}.git"
 
     if mirror_path.exists():
         # Update the mirror
@@ -86,8 +81,7 @@ def _ensure_worktree(mirror_path: Path, repo: str, commit: str) -> Path:
     Returns:
         Path to the worktree directory.
     """
-    safe_name = repo.replace("/", "__")
-    worktree_path = WORKTREES_DIR / safe_name / commit
+    worktree_path = WORKTREES_DIR / repo_to_dirname(repo) / commit
 
     if worktree_path.exists():
         # Verify HEAD matches expected commit

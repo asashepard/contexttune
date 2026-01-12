@@ -119,4 +119,51 @@ Minimal, pinned in `requirements.txt`:
 - [x] Minimal single-shot inference runner (Step 3)
 - [x] Repo signals extraction (Step 4)
 - [x] Baseline context generation (Step 5)
-- [ ] Pipeline orchestration (Step 6)
+- [x] Pipeline orchestration (Step 6)
+
+## Step 6: Verified Mini Baseline Experiment
+
+### Usage
+
+```bash
+# Dry-run (skip model calls, test plumbing)
+python scripts/run_verified_mini_baseline.py --model local/placeholder --dry_run
+
+# Full run with local model
+export OPENAI_BASE_URL="http://localhost:8000/v1"
+python scripts/run_verified_mini_baseline.py --model my-model --max_workers_eval 4
+```
+
+### Output Layout
+
+```
+artifacts/preds/<group_id>/no_context/preds.jsonl
+artifacts/preds/<group_id>/baseline_context/preds.jsonl
+results/<group_id>__no_context/           # harness outputs
+results/<group_id>__baseline_context/     # harness outputs
+results/<group_id>/
+  ├── logs/                               # pipeline step logs
+  ├── summary.json                        # comparison summary
+```
+
+### summary.json Schema
+
+```json
+{
+  "group_id": "verified_mini_20260111_175000_a1b2",
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "split": "test",
+  "model": "local/placeholder",
+  "instance_count": 50,
+  "conditions": {
+    "no_context": {"resolved": 0, "total": 50, "rate": 0.0, ...},
+    "baseline_context": {"resolved": 0, "total": 50, "rate": 0.0, ...}
+  },
+  "delta": {"resolved": 0, "rate": 0.0}
+}
+```
+
+### Prerequisites
+
+- Docker must be running for harness evaluation
+- Signals and contexts are built automatically (cached unless --force)

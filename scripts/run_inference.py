@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from context_policy.datasets.swebench import load_instances, read_instance_ids
+from context_policy.runner.mini_swe_agent import generate_patch_with_mini
 from context_policy.runner.single_shot import generate_patch
 from context_policy.utils.jsonl import read_jsonl
 from context_policy.utils.paths import CONTEXTS_DIR, LOGS_DIR, PREDS_DIR, get_context_path
@@ -131,6 +132,18 @@ def main() -> None:
         action="store_true",
         help="Skip model calls; emit empty patches. Useful for plumbing validation.",
     )
+    parser.add_argument(
+        "--runner",
+        choices=["single_shot", "mini_swe_agent"],
+        default="single_shot",
+        help="Runner backend (default: single_shot).",
+    )
+    parser.add_argument(
+        "--cost_limit",
+        type=float,
+        default=0.0,
+        help="Cost limit for mini_swe_agent runner (0 = no limit).",
+    )
 
     args = parser.parse_args()
 
@@ -200,7 +213,7 @@ def main() -> None:
             # Generate patch (or placeholder in dry-run mode)
             if args.dry_run:
                 patch = ""  # Empty patch for plumbing validation
-            else:
+            elif args.runner == "single_shot":
                 patch = generate_patch(
                     instance=instance,
                     model=args.model,
@@ -210,6 +223,16 @@ def main() -> None:
                     max_tokens=args.max_tokens,
                     timeout_s=args.timeout_s,
                 )
+            elif args.runner == "mini_swe_agent":
+                patch = generate_patch_with_mini(
+                    instance=instance,
+                    model=args.model,
+                    context_md=context_md,
+                    timeout_s=args.timeout_s,
+                    cost_limit=args.cost_limit,
+                )
+            else:
+                raise ValueError(f"Unknown runner: {args.runner}")
 
             # Build prediction record
             record = {

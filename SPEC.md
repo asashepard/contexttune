@@ -167,3 +167,42 @@ results/<group_id>/
 
 - Docker must be running for harness evaluation
 - Signals and contexts are built automatically (cached unless --force)
+
+## Runner Backends
+
+The inference runner supports multiple backends via `--runner`:
+
+| Runner | Description | Requirements |
+|--------|-------------|--------------|
+| `single_shot` | Single LLM call, extract diff from response | OpenAI-compatible API |
+| `mini_swe_agent` | Agentic loop via mini-swe-agent | `pip install mini-swe-agent`, OpenAI/Anthropic API |
+
+### Usage
+
+```bash
+# Default: single-shot runner
+python scripts/run_inference.py --model gpt-4 --limit 1
+
+# Agentic runner (requires mini-swe-agent installed)
+python scripts/run_inference.py --model openai/gpt-4 --runner mini_swe_agent --limit 1
+```
+
+### Context Block Delimiters
+
+When context is injected, it uses these delimiters (identical across all runners):
+
+```
+======BEGIN_REPO_CONTEXT=====
+<context_md content>
+======END_REPO_CONTEXT=====
+```
+
+This ensures the experimental variable is the **context artifact**, not the runner wiring.
+
+### Invariant
+
+The SWE-bench harness evaluation is **unchanged** regardless of runner. All runners output the same JSONL format:
+
+```json
+{"instance_id": "...", "model_name_or_path": "...", "model_patch": "..."}
+```

@@ -1,54 +1,12 @@
 """Single-shot patch generation runner."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 from context_policy.git.checkout import checkout_repo
 from context_policy.llm.openai_compat import chat_completion
 from context_policy.prompting.prompt_builder import build_messages
-
-
-# Maximum allowed patch size (chars) - safety limit
-MAX_PATCH_SIZE = 200_000
-
-
-def _extract_diff(text: str) -> str:
-    """Extract unified diff from model output.
-
-    Tries in order:
-    1. Fenced code block with ```diff ... ```
-    2. First line starting with "diff --git" and everything after
-    3. First line starting with "--- " and everything after
-    4. Empty string if no diff found
-
-    Args:
-        text: Raw model output.
-
-    Returns:
-        Extracted diff string or empty string.
-    """
-    # Try fenced diff block
-    fence_pattern = r"```(?:diff)?\s*\n(.*?)```"
-    matches = re.findall(fence_pattern, text, re.DOTALL)
-    if matches:
-        # Return the first fenced block that looks like a diff
-        for match in matches:
-            if "---" in match or "diff --git" in match:
-                return match.strip()
-
-    # Try to find diff --git line
-    lines = text.split("\n")
-    for i, line in enumerate(lines):
-        if line.startswith("diff --git "):
-            return "\n".join(lines[i:]).strip()
-
-    # Try to find --- line (start of unified diff)
-    for i, line in enumerate(lines):
-        if line.startswith("--- "):
-            return "\n".join(lines[i:]).strip()
-
-    return ""
+from context_policy.runner.patch_utils import MAX_PATCH_SIZE, extract_diff
 
 
 def generate_patch(
@@ -102,7 +60,7 @@ def generate_patch(
     )
 
     # Extract diff
-    diff = _extract_diff(response)
+    diff = extract_diff(response)
 
     # Safety: reject oversized patches
     if len(diff) > MAX_PATCH_SIZE:

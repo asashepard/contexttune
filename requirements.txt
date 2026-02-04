@@ -8,6 +8,10 @@ requests>=2.31.0
 # HuggingFace datasets for loading SWE-bench instances
 datasets>=2.14.0
 
-# Optional: mini-swe-agent for agentic runner backend
-# Uncomment to enable --runner mini_swe_agent
+# Optional: mini-swe-agent for agentic runner backends
+# Uncomment to enable --runner mini_swe_agent or mini_swe_agent_swebench
 # mini-swe-agent~=1.17
+
+# Optional: Docker SDK for programmatic container control
+# Uncomment if using mini_swe_agent_swebench runner
+# docker>=6.0.0

@@ -59,14 +59,21 @@ def load_instances(
     if limit is not None and limit < len(ds):
         ds = ds.select(range(limit))
 
-    # Extract only needed fields
+    # Extract needed fields
+    # Additional fields for docker-native runner: version, environment_setup_commit
     instances = []
     for row in ds:
-        instances.append({
+        inst = {
             "instance_id": row["instance_id"],
             "repo": row["repo"],
             "base_commit": row["base_commit"],
             "problem_statement": row["problem_statement"],
-        })
+        }
+        # Optional fields for docker-native runner
+        if "version" in row:
+            inst["version"] = row["version"]
+        if "environment_setup_commit" in row:
+            inst["environment_setup_commit"] = row["environment_setup_commit"]
+        instances.append(inst)
 
     return instances

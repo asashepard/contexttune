@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from context_policy.datasets.swebench import load_instances, read_instance_ids
 from context_policy.runner.mini_swe_agent import generate_patch_with_mini
+from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench
 from context_policy.runner.single_shot import generate_patch
 from context_policy.utils.jsonl import read_jsonl
 from context_policy.utils.paths import CONTEXTS_DIR, LOGS_DIR, PREDS_DIR, get_context_path
@@ -134,7 +135,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--runner",
-        choices=["single_shot", "mini_swe_agent"],
+        choices=["single_shot", "mini_swe_agent", "mini_swe_agent_swebench"],
         default="single_shot",
         help="Runner backend (default: single_shot).",
     )
@@ -230,6 +231,14 @@ def main() -> None:
                     context_md=context_md,
                     timeout_s=args.timeout_s,
                     cost_limit=args.cost_limit,
+                )
+            elif args.runner == "mini_swe_agent_swebench":
+                patch = generate_patch_with_mini_swebench(
+                    instance=instance,
+                    model=args.model,
+                    context_md=context_md,
+                    timeout_s=args.timeout_s,
+                    traj_dir=logs_dir / "trajectories",
                 )
             else:
                 raise ValueError(f"Unknown runner: {args.runner}")

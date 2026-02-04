@@ -175,7 +175,24 @@ The inference runner supports multiple backends via `--runner`:
 | Runner | Description | Requirements |
 |--------|-------------|--------------|
 | `single_shot` | Single LLM call, extract diff from response | OpenAI-compatible API |
-| `mini_swe_agent` | Agentic loop via mini-swe-agent | `pip install mini-swe-agent`, OpenAI/Anthropic API |
+| `mini_swe_agent` | Agentic loop via mini-swe-agent CLI (local env) | `pip install mini-swe-agent`, OpenAI/Anthropic API |
+| `mini_swe_agent_swebench` | Agentic loop in SWE-bench Docker environment | Docker daemon + Linux, `pip install mini-swe-agent docker` |
+
+### Recommended Runner for Non-Zero Baseline
+
+For achieving a non-zero baseline on SWE-bench Verified Mini, use `mini_swe_agent_swebench`:
+
+```bash
+# Requires: Docker daemon running, Linux/WSL2 environment
+python scripts/run_inference.py \
+    --model openai/gpt-4 \
+    --runner mini_swe_agent_swebench \
+    --ablation baseline_context \
+    --limit 50
+```
+
+This runner executes the agent inside the same Docker container environment that SWE-bench
+uses for evaluation, ensuring environment parity (correct Python version, dependencies, etc.).
 
 ### Usage
 
@@ -183,8 +200,11 @@ The inference runner supports multiple backends via `--runner`:
 # Default: single-shot runner
 python scripts/run_inference.py --model gpt-4 --limit 1
 
-# Agentic runner (requires mini-swe-agent installed)
+# Agentic runner - local environment (requires mini-swe-agent installed)
 python scripts/run_inference.py --model openai/gpt-4 --runner mini_swe_agent --limit 1
+
+# Agentic runner - SWE-bench Docker environment (requires Docker + Linux)
+python scripts/run_inference.py --model openai/gpt-4 --runner mini_swe_agent_swebench --limit 1
 ```
 
 ### Context Block Delimiters

@@ -1,12 +1,14 @@
 """Docker-native SWE-agent runner using mini-swe-agent with SWE-bench Docker environment."""
 from __future__ import annotations
 
+import inspect
 import json
 import multiprocessing
 import os
 import queue
 import subprocess
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +26,8 @@ from context_policy.runner.patch_utils import (
 )
 
 # Default step limit to prevent the agent from looping indefinitely.
-# Most SWE-bench fixes need <20 tool calls; 40 gives margin without runaway loops.
-DEFAULT_MAX_STEPS = 40
+# Experiment spec v1.1 uses 30 steps.
+DEFAULT_MAX_STEPS = 30
 
 
 def _get_instance_docker_image(instance: dict) -> str:
@@ -104,6 +106,46 @@ def _get_instance_docker_image(instance: dict) -> str:
     return fallback
 
 
+def _extract_diff_from_containers() -> str:
+    """Extract git diff from any running minisweagent Docker container.
+
+    SWE-bench containers have the repo at /testbed.  After the agent runs
+    commands inside the container we can extract whatever changes were made.
+    This is the most reliable way to get the patch — it doesn't depend on
+    the mini-swe-agent Python API return type at all.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "name=minisweagent-"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        containers = result.stdout.strip().split()
+        if not containers:
+            return ""
+
+        cid = containers[0]
+        # Try common repo locations in SWE-bench containers
+        for workdir in ["/testbed", "/workspace", "/repo"]:
+            try:
+                result = subprocess.run(
+                    ["docker", "exec", "-w", workdir, cid, "git", "diff"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    diff = result.stdout.strip()
+                    print(f"  Extracted diff from container {cid[:12]} at {workdir} ({len(diff)} chars)")
+                    return diff
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"  WARNING: container diff extraction failed: {e}")
+    return ""
+
+
 def _run_agent_in_docker(
     task: str,
     model: str,
@@ -117,6 +159,9 @@ def _run_agent_in_docker(
 
     This function is designed to run in a separate process for timeout enforcement.
     Results are placed in result_queue as (patch_str, error_msg) tuple.
+
+    The function is defensively coded: it discovers the actual mini-swe-agent
+    API at runtime rather than assuming return types or parameter names.
     """
     try:
         # Import inside subprocess to isolate import errors
@@ -124,36 +169,117 @@ def _run_agent_in_docker(
         from minisweagent.environments.docker import DockerEnvironment
         from minisweagent.models.litellm_model import LitellmModel
 
-        # Create Docker environment pointing to the SWE-bench image
-        env = DockerEnvironment(image=image_name)
+        # ---- Discover API signatures and log them ----
+        init_sig = inspect.signature(DefaultAgent.__init__)
+        init_params = list(init_sig.parameters.keys())
+        print(f"  DefaultAgent.__init__ params: {init_params}")
 
-        # Create model instance
+        # ---- Build environment + model ----
+        env = DockerEnvironment(image=image_name)
         model_instance = LitellmModel(model_name=model)
 
-        # Create agent with model, environment, and step limit.
-        # max_steps prevents infinite agent loops and bounds API cost.
         agent_kwargs: dict[str, Any] = {
             "model": model_instance,
             "env": env,
         }
-        # Pass max_steps if the API supports it (minisweagent >=1.15)
-        import inspect
-        sig = inspect.signature(DefaultAgent.__init__)
-        if "max_steps" in sig.parameters:
-            agent_kwargs["max_steps"] = max_steps
+
+        # Try various parameter names for step limit
+        _STEP_PARAM_NAMES = [
+            "max_steps", "max_iterations", "step_limit",
+            "n_steps", "max_turns", "steps",
+        ]
+        step_applied = False
+        for step_param in _STEP_PARAM_NAMES:
+            if step_param in init_params:
+                agent_kwargs[step_param] = max_steps
+                print(f"  Step limit: {step_param}={max_steps}")
+                step_applied = True
+                break
+        if not step_applied:
+            print(
+                f"  WARNING: no step-limit param found in DefaultAgent "
+                f"(tried {_STEP_PARAM_NAMES}). Agent may loop indefinitely."
+            )
 
         agent = DefaultAgent(**agent_kwargs)
 
-        # Run agent with task - returns (patch, trajectory_json_str)
-        patch, traj_json = agent.run(task)
+        # Log run() signature for debugging
+        run_sig = inspect.signature(agent.run)
+        print(f"  DefaultAgent.run params: {list(run_sig.parameters.keys())}")
 
-        # Save trajectory
-        if traj_json:
+        # ---- Run the agent ----
+        result = agent.run(task)
+        print(f"  agent.run() returned type={type(result).__name__}")
+
+        # ---- Extract patch from result (handle ANY return type) ----
+        patch = ""
+        traj_data = None
+
+        if isinstance(result, tuple):
+            if len(result) >= 2:
+                patch = result[0] if isinstance(result[0], str) else ""
+                traj_data = result[1]
+            elif len(result) == 1:
+                patch = result[0] if isinstance(result[0], str) else ""
+            print(f"  Tuple result: len={len(result)}, patch_len={len(patch)}")
+
+        elif isinstance(result, dict):
+            for k in ["patch", "model_patch", "diff", "output"]:
+                if k in result and isinstance(result[k], str) and result[k].strip():
+                    patch = result[k].strip()
+                    break
+            traj_data = result.get(
+                "trajectory", result.get("traj", result.get("history", None))
+            )
+            print(f"  Dict result: keys={list(result.keys())}, patch_len={len(patch)}")
+
+        elif isinstance(result, str):
+            patch = result
+            print(f"  String result: len={len(patch)}")
+
+        elif result is not None:
+            # Object with attributes
+            for attr in ["patch", "model_patch", "diff", "output"]:
+                val = getattr(result, attr, None)
+                if isinstance(val, str) and val.strip():
+                    patch = val.strip()
+                    break
+            traj_data = getattr(
+                result, "trajectory", getattr(result, "traj", None)
+            )
+            public_attrs = [a for a in dir(result) if not a.startswith("_")]
+            print(
+                f"  Object result: type={type(result).__name__}, "
+                f"attrs={public_attrs}, patch_len={len(patch)}"
+            )
+        else:
+            print("  None result from agent.run()")
+
+        # ---- Save trajectory data if we got any ----
+        if traj_data:
             try:
+                if isinstance(traj_data, str):
+                    content = traj_data
+                elif isinstance(traj_data, (dict, list)):
+                    content = json.dumps(traj_data, indent=2)
+                else:
+                    content = str(traj_data)
                 with open(traj_path, "w", encoding="utf-8") as f:
-                    f.write(traj_json)
-            except Exception:
-                pass
+                    f.write(content)
+                print(f"  Saved trajectory to {traj_path}")
+            except Exception as e:
+                print(f"  WARNING: failed to save trajectory: {e}")
+
+        # ---- Fallback: extract git diff directly from Docker container ----
+        if not patch:
+            print("  No patch from agent return value, trying container diff...")
+            patch = _extract_diff_from_containers()
+
+        # ---- Fallback: extract from trajectory file ----
+        if not patch and traj_path.exists():
+            patch = extract_patch_from_trajectory(str(traj_path))
+            if patch:
+                print(f"  Extracted patch from trajectory file ({len(patch)} chars)")
 
         result_queue.put((patch or "", None))
 
@@ -166,7 +292,13 @@ def _run_agent_in_docker(
             )
         )
     except Exception as e:
-        result_queue.put(("", f"Agent error: {e}"))
+        tb_str = traceback.format_exc()
+        print(f"  Agent error: {e}\n{tb_str}")
+        # Even on error, try to recover diff from the container
+        fallback = _extract_diff_from_containers()
+        result_queue.put(
+            (fallback, f"Agent error: {e}" if not fallback else None)
+        )
 
 
 def _stop_orphan_containers() -> None:
@@ -239,7 +371,7 @@ def generate_patch_with_mini_swebench(
         model: Model name for mini-swe-agent (e.g., "openai/gpt-4").
         context_md: Optional context to prepend to problem statement.
         timeout_s: Timeout for agent run in seconds (default 600 = 10 min).
-        max_steps: Maximum number of agent steps (default 40).
+        max_steps: Maximum number of agent steps (default 30).
         traj_dir: Optional directory to save trajectory files.
 
     Returns:
@@ -290,16 +422,27 @@ def generate_patch_with_mini_swebench(
         proc.join(timeout=timeout_s)
 
         if proc.is_alive():
-            # Timeout: terminate the process
+            # Timeout: terminate the Python process
             proc.terminate()
             proc.join(timeout=5)
             if proc.is_alive():
                 proc.kill()
                 proc.join()
             print(f"  mini-swe-agent-swebench timed out after {timeout_s}s")
-            # Stop orphaned Docker containers from the agent
+
+            # CRITICAL: extract diff from the Docker container BEFORE stopping it.
+            # The container is still running (started with 'sleep 2h') and holds
+            # whatever file changes the agent made during its run.
+            container_patch = _extract_diff_from_containers()
+
+            # Now stop orphaned Docker containers
             _stop_orphan_containers()
-            # Try to salvage a patch from trajectory/queue even on timeout
+
+            if container_patch and len(container_patch) <= MAX_PATCH_SIZE:
+                print(f"  Recovered patch from container on timeout ({len(container_patch)} chars)")
+                return container_patch
+
+            # Fall back to trajectory / queue
             return _salvage_patch(traj_path, result_queue)
 
         # Get result from queue (use .get with timeout, not .empty() which is unreliable)
@@ -343,28 +486,50 @@ if __name__ == "__main__":
     import sys
 
     print("Checking mini-swe-agent API availability...")
+    print()
 
     try:
         from minisweagent.agents.default import DefaultAgent
 
         print(f"  DefaultAgent: {DefaultAgent}")
-        import inspect
-
         sig = inspect.signature(DefaultAgent.__init__)
         print(f"  DefaultAgent.__init__ signature: {sig}")
+        print(f"  __init__ params: {list(sig.parameters.keys())}")
+
+        # Check run() method
+        run_sig = inspect.signature(DefaultAgent.run)
+        print(f"  DefaultAgent.run signature: {run_sig}")
+        print(f"  run() params: {list(run_sig.parameters.keys())}")
+
+        # List all public methods/attrs
+        public = [m for m in dir(DefaultAgent) if not m.startswith("_")]
+        print(f"  Public members: {public}")
     except ImportError as e:
         print(f"  DefaultAgent not available: {e}")
+
+    print()
 
     try:
         from minisweagent.environments.docker import DockerEnvironment
 
         print(f"  DockerEnvironment: {DockerEnvironment}")
-        import inspect
-
         sig = inspect.signature(DockerEnvironment.__init__)
         print(f"  DockerEnvironment.__init__ signature: {sig}")
     except ImportError as e:
         print(f"  DockerEnvironment not available: {e}")
+
+    print()
+
+    try:
+        from minisweagent.models.litellm_model import LitellmModel
+
+        print(f"  LitellmModel: {LitellmModel}")
+        sig = inspect.signature(LitellmModel.__init__)
+        print(f"  LitellmModel.__init__ signature: {sig}")
+    except ImportError as e:
+        print(f"  LitellmModel not available: {e}")
+
+    print()
 
     try:
         from swebench.harness.docker_utils import get_instance_docker_image

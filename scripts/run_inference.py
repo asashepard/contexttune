@@ -148,8 +148,8 @@ def main() -> None:
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=40,
-        help="Max agent steps for mini_swe_agent_swebench runner (default: 40).",
+        default=30,
+        help="Max agent steps for mini_swe_agent_swebench runner (default: 30).",
     )
 
     args = parser.parse_args()

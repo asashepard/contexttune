@@ -17,7 +17,7 @@ set -euo pipefail
 MODEL=""
 IDS_FILE="scripts/smoke_3_ids.txt"
 TIMEOUT_S=180
-MAX_STEPS=30
+STEP_LIMIT=30
 DATASET="princeton-nlp/SWE-bench_Verified"
 
 # Parse args
@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
     --model)    MODEL="$2"; shift 2 ;;
     --ids)      IDS_FILE="$2"; shift 2 ;;
     --timeout)  TIMEOUT_S="$2"; shift 2 ;;
-    --steps)    MAX_STEPS="$2"; shift 2 ;;
+    --steps)    STEP_LIMIT="$2"; shift 2 ;;
     *)          echo "Unknown arg: $1"; exit 2 ;;
   esac
 done
@@ -66,7 +66,7 @@ echo "============================================================"
 echo "  Model:     $MODEL"
 echo "  IDs file:  $IDS_FILE"
 echo "  Timeout:   ${TIMEOUT_S}s per instance"
-echo "  Max steps: $MAX_STEPS"
+echo "  Max steps: $STEP_LIMIT"
 echo ""
 
 echo "[1/6] Checking prerequisites..."
@@ -106,7 +106,7 @@ python scripts/run_inference.py \
   --ablation baseline_context \
   --instance_ids_file "$IDS_FILE" \
   --timeout_s "$TIMEOUT_S" \
-  --max_steps "$MAX_STEPS"
+  --step_limit "$STEP_LIMIT"
 echo ""
 
 # ── Find run ID and evaluate ──

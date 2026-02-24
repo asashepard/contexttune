@@ -146,10 +146,10 @@ def main() -> None:
         help="Cost limit for mini_swe_agent runner (0 = no limit).",
     )
     parser.add_argument(
-        "--max_steps",
+        "--step_limit",
         type=int,
         default=30,
-        help="Max agent steps for mini_swe_agent_swebench runner (default: 30).",
+        help="Agent step limit for mini_swe_agent_swebench runner (default: 30; 0=unlimited).",
     )
 
     args = parser.parse_args()
@@ -260,7 +260,7 @@ def main() -> None:
                     context_md=context_md,
                     timeout_s=args.timeout_s,
                     traj_dir=logs_dir / "trajectories",
-                    max_steps=args.max_steps,
+                    step_limit=args.step_limit,
                 )
             else:
                 raise ValueError(f"Unknown runner: {args.runner}")

@@ -159,15 +159,21 @@ def _run_agent_in_docker(
     repo_dir: Path,
     traj_path: Path,
     result_queue: multiprocessing.Queue,
-    max_steps: int = DEFAULT_MAX_STEPS,
+    step_limit: int = DEFAULT_MAX_STEPS,
 ) -> None:
     """Run mini-swe-agent with DockerEnvironment in a subprocess.
 
     This function is designed to run in a separate process for timeout enforcement.
     Results are placed in result_queue as (patch_str, error_msg) tuple.
 
-    The function is defensively coded: it discovers the actual mini-swe-agent
-    API at runtime rather than assuming return types or parameter names.
+    mini-swe-agent 1.17 API (confirmed via introspection):
+      - DefaultAgent(model, env, **kwargs)  → kwargs forwarded to AgentConfig
+      - AgentConfig(step_limit=0, cost_limit=3.0, ...)  → step_limit=0 means unlimited
+      - agent.run(task) -> tuple[str, str]  → (result_label, result_detail)
+      - Agent finishes when shell command outputs 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'
+
+    The agent makes changes inside the Docker container at /testbed.
+    We extract the patch via `docker exec git diff` from the container.
     """
     try:
         # Import inside subprocess to isolate import errors
@@ -175,157 +181,50 @@ def _run_agent_in_docker(
         from minisweagent.environments.docker import DockerEnvironment
         from minisweagent.models.litellm_model import LitellmModel
 
-        # ---- Discover API signatures ----
-        init_sig = inspect.signature(DefaultAgent.__init__)
-        init_params = list(init_sig.parameters.keys())
-        print(f"  DefaultAgent.__init__ params: {init_params}")
-
-        # ---- Discover AgentConfig params (step limit lives here) ----
-        config_params: list[str] = []
-        try:
-            from minisweagent.agents.default import AgentConfig
-            config_sig = inspect.signature(AgentConfig.__init__)
-            config_params = list(config_sig.parameters.keys())
-            print(f"  AgentConfig params: {config_params}")
-        except ImportError:
-            # Try to get it from the default value in DefaultAgent.__init__
-            config_cls = init_sig.parameters.get("config_class")
-            if config_cls and config_cls.default is not inspect.Parameter.empty:
-                try:
-                    config_sig = inspect.signature(config_cls.default.__init__)
-                    config_params = list(config_sig.parameters.keys())
-                    print(f"  config_class params: {config_params}")
-                except Exception:
-                    pass
-
-        # Print run() source for debugging (helps us understand the step loop)
-        try:
-            run_source = inspect.getsource(DefaultAgent.run)
-            # Print first 30 lines
-            lines = run_source.split("\n")[:30]
-            print(f"  DefaultAgent.run source (first 30 lines):")
-            for line in lines:
-                print(f"    {line}")
-        except Exception:
-            pass
-
-        # ---- Build environment + model ----
+        # ---- Build components ----
         env = DockerEnvironment(image=image_name)
         model_instance = LitellmModel(model_name=model)
 
-        agent_kwargs: dict[str, Any] = {
-            "model": model_instance,
-            "env": env,
-        }
-
-        # Try various parameter names for step limit.
-        # DefaultAgent takes **kwargs and forwards them to AgentConfig,
-        # so we check BOTH sets of params.
-        _STEP_PARAM_NAMES = [
-            "max_steps", "max_iterations", "step_limit",
-            "n_steps", "max_turns", "steps",
-        ]
-        all_known_params = set(init_params) | set(config_params)
-        step_applied = False
-        for step_param in _STEP_PARAM_NAMES:
-            if step_param in all_known_params:
-                agent_kwargs[step_param] = max_steps
-                print(f"  Step limit: {step_param}={max_steps}")
-                step_applied = True
-                break
-
-        # Even if not in known params, DefaultAgent takes **kwargs.
-        # Try passing max_steps anyway — it'll forward to AgentConfig.
-        if not step_applied and "kwargs" in init_params:
-            agent_kwargs["max_steps"] = max_steps
-            print(f"  Step limit: passing max_steps={max_steps} via **kwargs (speculative)")
-            step_applied = True
-
-        if not step_applied:
-            print(
-                f"  WARNING: could not inject step-limit. "
-                f"Agent may loop indefinitely."
-            )
-
-        agent = DefaultAgent(**agent_kwargs)
+        # Pass step_limit to AgentConfig via **kwargs.
+        # step_limit=0 means unlimited in mini-swe-agent; we set it to 30.
+        print(f"  Creating agent: step_limit={step_limit}, image={image_name}")
+        agent = DefaultAgent(
+            model=model_instance,
+            env=env,
+            step_limit=step_limit,
+        )
 
         # ---- Run the agent ----
-        # run() -> tuple[str, str] confirmed by introspection
-        run_sig = inspect.signature(agent.run)
-        print(f"  Calling agent.run() (params: {list(run_sig.parameters.keys())})")
+        # run() -> tuple[str, str]: (result_label, result_detail)
+        # result_label is e.g. "TerminatingException" or completion text
+        # result_detail is the error message or completion output
+        print(f"  Running agent on task ({len(task)} chars)...")
+        result_label, result_detail = agent.run(task)
+        print(f"  Agent finished: label={result_label!r}, detail_len={len(result_detail)}")
 
-        result = agent.run(task)
-        print(f"  agent.run() returned type={type(result).__name__}")
+        # ---- Extract patch from Docker container (most reliable) ----
+        # The agent modifies files in /testbed inside the container.
+        # `git diff` gives us exactly what changed.
+        patch = _extract_diff_from_containers()
 
-        # ---- Extract patch from result (handle ANY return type) ----
-        patch = ""
-        traj_data = None
-
-        if isinstance(result, tuple):
-            if len(result) >= 2:
-                patch = result[0] if isinstance(result[0], str) else ""
-                traj_data = result[1]
-            elif len(result) == 1:
-                patch = result[0] if isinstance(result[0], str) else ""
-            print(f"  Tuple result: len={len(result)}, patch_len={len(patch)}")
-
-        elif isinstance(result, dict):
-            for k in ["patch", "model_patch", "diff", "output"]:
-                if k in result and isinstance(result[k], str) and result[k].strip():
-                    patch = result[k].strip()
-                    break
-            traj_data = result.get(
-                "trajectory", result.get("traj", result.get("history", None))
-            )
-            print(f"  Dict result: keys={list(result.keys())}, patch_len={len(patch)}")
-
-        elif isinstance(result, str):
-            patch = result
-            print(f"  String result: len={len(patch)}")
-
-        elif result is not None:
-            # Object with attributes
-            for attr in ["patch", "model_patch", "diff", "output"]:
-                val = getattr(result, attr, None)
-                if isinstance(val, str) and val.strip():
-                    patch = val.strip()
-                    break
-            traj_data = getattr(
-                result, "trajectory", getattr(result, "traj", None)
-            )
-            public_attrs = [a for a in dir(result) if not a.startswith("_")]
-            print(
-                f"  Object result: type={type(result).__name__}, "
-                f"attrs={public_attrs}, patch_len={len(patch)}"
-            )
-        else:
-            print("  None result from agent.run()")
-
-        # ---- Save trajectory data if we got any ----
-        if traj_data:
-            try:
-                if isinstance(traj_data, str):
-                    content = traj_data
-                elif isinstance(traj_data, (dict, list)):
-                    content = json.dumps(traj_data, indent=2)
-                else:
-                    content = str(traj_data)
-                with open(traj_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                print(f"  Saved trajectory to {traj_path}")
-            except Exception as e:
-                print(f"  WARNING: failed to save trajectory: {e}")
-
-        # ---- Fallback: extract git diff directly from Docker container ----
-        if not patch:
-            print("  No patch from agent return value, trying container diff...")
-            patch = _extract_diff_from_containers()
-
-        # ---- Fallback: extract from trajectory file ----
-        if not patch and traj_path.exists():
-            patch = extract_patch_from_trajectory(str(traj_path))
+        # If container diff failed, check if the agent returned a patch directly
+        if not patch and result_detail:
+            patch = extract_diff(result_detail)
             if patch:
-                print(f"  Extracted patch from trajectory file ({len(patch)} chars)")
+                print(f"  Extracted patch from agent output ({len(patch)} chars)")
+
+        # ---- Save trajectory / agent output for debugging ----
+        try:
+            traj_data = {
+                "result_label": result_label,
+                "result_detail": result_detail,
+                "patch_len": len(patch) if patch else 0,
+            }
+            with open(traj_path, "w", encoding="utf-8") as f:
+                json.dump(traj_data, f, indent=2)
+            print(f"  Saved agent output to {traj_path}")
+        except Exception as e:
+            print(f"  WARNING: failed to save trajectory: {e}")
 
         result_queue.put((patch or "", None))
 
@@ -399,7 +298,7 @@ def generate_patch_with_mini_swebench(
     context_md: str | None = None,
     *,
     timeout_s: int = 600,
-    max_steps: int = DEFAULT_MAX_STEPS,
+    step_limit: int = DEFAULT_MAX_STEPS,
     traj_dir: Path | None = None,
 ) -> str:
     """Generate a patch using mini-swe-agent with SWE-bench Docker environment.
@@ -417,7 +316,7 @@ def generate_patch_with_mini_swebench(
         model: Model name for mini-swe-agent (e.g., "openai/gpt-4").
         context_md: Optional context to prepend to problem statement.
         timeout_s: Timeout for agent run in seconds (default 600 = 10 min).
-        max_steps: Maximum number of agent steps (default 30).
+        step_limit: Maximum number of agent steps (default 30; 0=unlimited).
         traj_dir: Optional directory to save trajectory files.
 
     Returns:
@@ -462,7 +361,7 @@ def generate_patch_with_mini_swebench(
         result_queue: multiprocessing.Queue = multiprocessing.Queue()
         proc = multiprocessing.Process(
             target=_run_agent_in_docker,
-            args=(task, model, image_name, repo_dir, traj_path, result_queue, max_steps),
+            args=(task, model, image_name, repo_dir, traj_path, result_queue, step_limit),
         )
         proc.start()
         proc.join(timeout=timeout_s)

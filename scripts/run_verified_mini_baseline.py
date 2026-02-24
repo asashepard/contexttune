@@ -161,10 +161,10 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--max_steps",
+        "--step_limit",
         type=int,
         default=30,
-        help="Max agent steps for mini_swe_agent_swebench (default: 30).",
+        help="Agent step limit for mini_swe_agent_swebench (default: 30; 0=unlimited).",
     )
 
     args = parser.parse_args()
@@ -274,7 +274,7 @@ def main() -> None:
                     "--ablation", condition,
                     "--runner", args.runner,
                     "--timeout_s", str(timeout_s),
-                    "--max_steps", str(args.max_steps),
+                    "--step_limit", str(args.step_limit),
                     "--run_id", run_id,
                     "--out", str(preds_path),
                     *dry_run_arg,

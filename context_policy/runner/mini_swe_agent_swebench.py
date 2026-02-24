@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -25,9 +26,10 @@ def _get_instance_docker_image(instance: dict) -> str:
     """Resolve Docker image name for SWE-bench instance.
 
     Priority:
-    1. swebench.harness.docker_utils.get_instance_docker_image() if available
+    1. swebench harness utilities (multiple API variants across versions)
     2. instance.get("image_name") field
-    3. Fallback: hardcoded SWE-bench naming convention
+    3. Query local Docker for images matching the instance_id substring
+    4. Fallback: hardcoded SWE-bench naming convention
 
     Args:
         instance: Instance dict with instance_id and optional image_name.
@@ -35,7 +37,10 @@ def _get_instance_docker_image(instance: dict) -> str:
     Returns:
         Docker image name string.
     """
-    # Try swebench helper first
+    instance_id = instance["instance_id"]
+
+    # ---------- Try swebench helpers (API varies by version) ----------
+    # Variant 1: get_instance_docker_image (newer swebench)
     try:
         from swebench.harness.docker_utils import get_instance_docker_image
 
@@ -45,22 +50,52 @@ def _get_instance_docker_image(instance: dict) -> str:
     except ImportError:
         pass
     except Exception as exc:
-        # Log the actual error so we can diagnose image resolution issues
-        print(f"  WARNING: swebench get_instance_docker_image failed: {exc}")
+        print(f"  WARNING: get_instance_docker_image failed: {exc}")
 
-    # Instance may have image_name field
+    # Variant 2: make_test_spec → spec.instance_image_key (swebench >=2.x)
+    try:
+        from swebench.harness.test_spec import make_test_spec
+
+        spec = make_test_spec(instance)
+        image = spec.instance_image_key
+        if image and not image.endswith(":latest"):
+            image = f"{image}:latest"
+        print(f"  Docker image (test_spec): {image}")
+        return image
+    except ImportError:
+        pass
+    except Exception as exc:
+        print(f"  WARNING: make_test_spec failed: {exc}")
+
+    # ---------- Instance field ----------
     if image_name := instance.get("image_name"):
         print(f"  Docker image (instance field): {image_name}")
         return image_name
 
-    # Fallback: SWE-bench naming convention
-    # Modern format: swebench/sweb.eval.x86_64.<repo_key>_<version>_<short_id>:latest
-    #   e.g. swebench/sweb.eval.x86_64.django_1776_django-10097:latest
-    # Legacy format: swebench/sweb.eval.x86_64.<instance_id>:latest
-    instance_id = instance["instance_id"]
-    image = f"swebench/sweb.eval.x86_64.{instance_id}:latest"
-    print(f"  Docker image (fallback): {image}")
-    return image
+    # ---------- Query Docker daemon for matching image ----------
+    # Image names contain the repo and issue number, e.g.
+    # swebench/sweb.eval.x86_64.django_1776_django-10097:latest
+    # Extract the short id (e.g. "django-10097") to search
+    short_id = instance_id.split("__")[-1]  # "django-10097"
+    try:
+        result = subprocess.run(
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                if short_id in line and "sweb.eval" in line:
+                    print(f"  Docker image (docker query): {line}")
+                    return line
+    except Exception:
+        pass
+
+    # ---------- Last-resort fallback ----------
+    fallback = f"swebench/sweb.eval.x86_64.{instance_id}:latest"
+    print(f"  Docker image (fallback): {fallback}")
+    return fallback
 
 
 def _run_agent_in_docker(

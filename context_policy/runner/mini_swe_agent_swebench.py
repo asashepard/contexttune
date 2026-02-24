@@ -39,21 +39,28 @@ def _get_instance_docker_image(instance: dict) -> str:
     try:
         from swebench.harness.docker_utils import get_instance_docker_image
 
-        return get_instance_docker_image(instance)
+        image = get_instance_docker_image(instance)
+        print(f"  Docker image (swebench helper): {image}")
+        return image
     except ImportError:
         pass
-    except Exception:
-        # swebench API may have changed; continue to fallback
-        pass
+    except Exception as exc:
+        # Log the actual error so we can diagnose image resolution issues
+        print(f"  WARNING: swebench get_instance_docker_image failed: {exc}")
 
     # Instance may have image_name field
     if image_name := instance.get("image_name"):
+        print(f"  Docker image (instance field): {image_name}")
         return image_name
 
     # Fallback: SWE-bench naming convention
-    # Format: swebench/sweb.eval.x86_64.<instance_id>:latest
+    # Modern format: swebench/sweb.eval.x86_64.<repo_key>_<version>_<short_id>:latest
+    #   e.g. swebench/sweb.eval.x86_64.django_1776_django-10097:latest
+    # Legacy format: swebench/sweb.eval.x86_64.<instance_id>:latest
     instance_id = instance["instance_id"]
-    return f"swebench/sweb.eval.x86_64.{instance_id}:latest"
+    image = f"swebench/sweb.eval.x86_64.{instance_id}:latest"
+    print(f"  Docker image (fallback): {image}")
+    return image
 
 
 def _run_agent_in_docker(

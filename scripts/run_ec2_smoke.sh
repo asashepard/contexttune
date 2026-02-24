@@ -16,7 +16,7 @@ set -euo pipefail
 # Defaults
 MODEL=""
 IDS_FILE="scripts/smoke_3_ids.txt"
-TIMEOUT_S=900
+TIMEOUT_S=180
 MAX_STEPS=30
 DATASET="princeton-nlp/SWE-bench_Verified"
 

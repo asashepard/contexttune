@@ -128,19 +128,25 @@ def _extract_diff_from_containers() -> str:
         cid = containers[0]
         # Try common repo locations in SWE-bench containers
         for workdir in ["/testbed", "/workspace", "/repo"]:
-            try:
-                result = subprocess.run(
-                    ["docker", "exec", "-w", workdir, cid, "git", "diff"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    diff = result.stdout.strip()
-                    print(f"  Extracted diff from container {cid[:12]} at {workdir} ({len(diff)} chars)")
-                    return diff
-            except Exception:
-                continue
+            # Try both unstaged and staged (HEAD) diffs
+            for diff_cmd in [
+                ["docker", "exec", "-w", workdir, cid, "git", "diff"],
+                ["docker", "exec", "-w", workdir, cid, "git", "diff", "HEAD"],
+            ]:
+                try:
+                    result = subprocess.run(
+                        diff_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        diff = result.stdout.strip()
+                        cmd_label = " ".join(diff_cmd[-2:])
+                        print(f"  Extracted {cmd_label} from container {cid[:12]} at {workdir} ({len(diff)} chars)")
+                        return diff
+                except Exception:
+                    continue
     except Exception as e:
         print(f"  WARNING: container diff extraction failed: {e}")
     return ""
@@ -169,10 +175,39 @@ def _run_agent_in_docker(
         from minisweagent.environments.docker import DockerEnvironment
         from minisweagent.models.litellm_model import LitellmModel
 
-        # ---- Discover API signatures and log them ----
+        # ---- Discover API signatures ----
         init_sig = inspect.signature(DefaultAgent.__init__)
         init_params = list(init_sig.parameters.keys())
         print(f"  DefaultAgent.__init__ params: {init_params}")
+
+        # ---- Discover AgentConfig params (step limit lives here) ----
+        config_params: list[str] = []
+        try:
+            from minisweagent.agents.default import AgentConfig
+            config_sig = inspect.signature(AgentConfig.__init__)
+            config_params = list(config_sig.parameters.keys())
+            print(f"  AgentConfig params: {config_params}")
+        except ImportError:
+            # Try to get it from the default value in DefaultAgent.__init__
+            config_cls = init_sig.parameters.get("config_class")
+            if config_cls and config_cls.default is not inspect.Parameter.empty:
+                try:
+                    config_sig = inspect.signature(config_cls.default.__init__)
+                    config_params = list(config_sig.parameters.keys())
+                    print(f"  config_class params: {config_params}")
+                except Exception:
+                    pass
+
+        # Print run() source for debugging (helps us understand the step loop)
+        try:
+            run_source = inspect.getsource(DefaultAgent.run)
+            # Print first 30 lines
+            lines = run_source.split("\n")[:30]
+            print(f"  DefaultAgent.run source (first 30 lines):")
+            for line in lines:
+                print(f"    {line}")
+        except Exception:
+            pass
 
         # ---- Build environment + model ----
         env = DockerEnvironment(image=image_name)
@@ -183,31 +218,42 @@ def _run_agent_in_docker(
             "env": env,
         }
 
-        # Try various parameter names for step limit
+        # Try various parameter names for step limit.
+        # DefaultAgent takes **kwargs and forwards them to AgentConfig,
+        # so we check BOTH sets of params.
         _STEP_PARAM_NAMES = [
             "max_steps", "max_iterations", "step_limit",
             "n_steps", "max_turns", "steps",
         ]
+        all_known_params = set(init_params) | set(config_params)
         step_applied = False
         for step_param in _STEP_PARAM_NAMES:
-            if step_param in init_params:
+            if step_param in all_known_params:
                 agent_kwargs[step_param] = max_steps
                 print(f"  Step limit: {step_param}={max_steps}")
                 step_applied = True
                 break
+
+        # Even if not in known params, DefaultAgent takes **kwargs.
+        # Try passing max_steps anyway — it'll forward to AgentConfig.
+        if not step_applied and "kwargs" in init_params:
+            agent_kwargs["max_steps"] = max_steps
+            print(f"  Step limit: passing max_steps={max_steps} via **kwargs (speculative)")
+            step_applied = True
+
         if not step_applied:
             print(
-                f"  WARNING: no step-limit param found in DefaultAgent "
-                f"(tried {_STEP_PARAM_NAMES}). Agent may loop indefinitely."
+                f"  WARNING: could not inject step-limit. "
+                f"Agent may loop indefinitely."
             )
 
         agent = DefaultAgent(**agent_kwargs)
 
-        # Log run() signature for debugging
-        run_sig = inspect.signature(agent.run)
-        print(f"  DefaultAgent.run params: {list(run_sig.parameters.keys())}")
-
         # ---- Run the agent ----
+        # run() -> tuple[str, str] confirmed by introspection
+        run_sig = inspect.signature(agent.run)
+        print(f"  Calling agent.run() (params: {list(run_sig.parameters.keys())})")
+
         result = agent.run(task)
         print(f"  agent.run() returned type={type(result).__name__}")
 
@@ -501,11 +547,51 @@ if __name__ == "__main__":
         print(f"  DefaultAgent.run signature: {run_sig}")
         print(f"  run() params: {list(run_sig.parameters.keys())}")
 
+        # Print run() source to see how step loop works
+        try:
+            run_source = inspect.getsource(DefaultAgent.run)
+            print(f"\n  DefaultAgent.run source:")
+            for line in run_source.split("\n"):
+                print(f"    {line}")
+        except Exception as e:
+            print(f"  Could not get run() source: {e}")
+
+        # Print step() source
+        try:
+            step_source = inspect.getsource(DefaultAgent.step)
+            print(f"\n  DefaultAgent.step source:")
+            for line in step_source.split("\n"):
+                print(f"    {line}")
+        except Exception as e:
+            print(f"  Could not get step() source: {e}")
+
         # List all public methods/attrs
         public = [m for m in dir(DefaultAgent) if not m.startswith("_")]
-        print(f"  Public members: {public}")
+        print(f"\n  Public members: {public}")
     except ImportError as e:
         print(f"  DefaultAgent not available: {e}")
+
+    print()
+
+    # ---- AgentConfig ----
+    try:
+        from minisweagent.agents.default import AgentConfig
+
+        print(f"  AgentConfig: {AgentConfig}")
+        sig = inspect.signature(AgentConfig.__init__)
+        print(f"  AgentConfig.__init__ signature: {sig}")
+        print(f"  AgentConfig params: {list(sig.parameters.keys())}")
+
+        # Print source to see all config fields
+        try:
+            config_source = inspect.getsource(AgentConfig)
+            print(f"\n  AgentConfig source:")
+            for line in config_source.split("\n")[:40]:
+                print(f"    {line}")
+        except Exception as e:
+            print(f"  Could not get AgentConfig source: {e}")
+    except ImportError as e:
+        print(f"  AgentConfig not available: {e}")
 
     print()
 

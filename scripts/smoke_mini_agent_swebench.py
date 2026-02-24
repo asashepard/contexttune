@@ -35,8 +35,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--model",
-        default="openai/gpt-4",
-        help="Model name for agent (default: openai/gpt-4).",
+        default="openai/gpt-4o",
+        help="Model name for agent (default: openai/gpt-4o).",
     )
     parser.add_argument(
         "--instance_id",

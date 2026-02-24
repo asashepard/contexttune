@@ -148,6 +148,21 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Auto-bump timeout for agent runners if the user left the default
+    _RUNNER_DEFAULT_TIMEOUT: dict[str, int] = {
+        "single_shot": 120,
+        "mini_swe_agent": 300,
+        "mini_swe_agent_swebench": 600,
+    }
+    if args.timeout_s == 120 and args.runner in _RUNNER_DEFAULT_TIMEOUT:
+        recommended = _RUNNER_DEFAULT_TIMEOUT[args.runner]
+        if recommended != args.timeout_s:
+            print(
+                f"NOTE: bumping --timeout_s from {args.timeout_s} to "
+                f"{recommended} (default for {args.runner} runner)."
+            )
+            args.timeout_s = recommended
+
     # Generate run_id if not provided
     run_id = args.run_id or make_run_id("infer")
 

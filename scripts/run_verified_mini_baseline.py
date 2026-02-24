@@ -30,7 +30,14 @@ from context_policy.utils.paths import PREDS_DIR, RESULTS_DIR
 from context_policy.utils.run_id import make_run_id
 from context_policy.utils.subproc import run as subproc_run
 
-CONDITIONS = ["no_context", "baseline_context"]
+DEFAULT_CONDITIONS = ["no_context", "baseline_context"]
+
+# Runner-specific default timeouts (seconds)
+_RUNNER_DEFAULT_TIMEOUT: dict[str, int] = {
+    "single_shot": 120,
+    "mini_swe_agent": 300,
+    "mini_swe_agent_swebench": 600,
+}
 
 
 def load_instance_ids(path: Path) -> list[str]:
@@ -130,14 +137,51 @@ def main() -> None:
         action="store_true",
         help="Pass --dry_run to inference (skip model calls).",
     )
+    parser.add_argument(
+        "--runner",
+        choices=["single_shot", "mini_swe_agent", "mini_swe_agent_swebench"],
+        default="single_shot",
+        help="Runner backend forwarded to run_inference.py (default: single_shot).",
+    )
+    parser.add_argument(
+        "--conditions",
+        default=None,
+        help=(
+            "Comma-separated conditions to run (default: no_context,baseline_context). "
+            "Example: --conditions baseline_context"
+        ),
+    )
+    parser.add_argument(
+        "--timeout_s",
+        type=int,
+        default=None,
+        help=(
+            "Per-instance timeout in seconds forwarded to run_inference.py. "
+            "If omitted, a runner-specific default is used (120/300/600)."
+        ),
+    )
 
     args = parser.parse_args()
+
+    # Resolve conditions
+    if args.conditions:
+        conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
+        for c in conditions:
+            if c not in ("no_context", "baseline_context"):
+                parser.error(f"Unknown condition: {c}")
+    else:
+        conditions = list(DEFAULT_CONDITIONS)
+
+    # Resolve timeout
+    timeout_s = args.timeout_s or _RUNNER_DEFAULT_TIMEOUT.get(args.runner, 120)
 
     # Generate group ID
     group_id = make_run_id(f"verified_{args.tag}")
     print(f"Group ID: {group_id}")
     print(f"Model: {args.model}")
-    print(f"Conditions: {CONDITIONS}")
+    print(f"Runner: {args.runner}")
+    print(f"Timeout: {timeout_s}s")
+    print(f"Conditions: {conditions}")
 
     # Setup logs directory
     logs_dir = RESULTS_DIR / group_id / "logs"
@@ -195,7 +239,7 @@ def main() -> None:
     # =========================================================================
     condition_results: dict[str, dict] = {}
 
-    for condition in CONDITIONS:
+    for condition in conditions:
         run_id = f"{group_id}__{condition}"
         preds_dir = PREDS_DIR / group_id / condition
         preds_path = preds_dir / "preds.jsonl"
@@ -222,6 +266,8 @@ def main() -> None:
                     *instance_args,
                     "--model", args.model,
                     "--ablation", condition,
+                    "--runner", args.runner,
+                    "--timeout_s", str(timeout_s),
                     "--run_id", run_id,
                     "--out", str(preds_path),
                     *dry_run_arg,
@@ -267,32 +313,41 @@ def main() -> None:
     print("SUMMARY")
     print(f"{'='*60}")
 
-    no_ctx = condition_results["no_context"]
-    base_ctx = condition_results["baseline_context"]
+    # Determine total from any condition that has data, or fall back to ID count
+    total = 0
+    for cr in condition_results.values():
+        if cr["total"]:
+            total = cr["total"]
+            break
+    if not total:
+        total = len(instance_ids) or args.limit
 
-    # Use the total from whichever has data, or instance count
-    total = base_ctx["total"] or no_ctx["total"] or len(instance_ids) or args.limit
+    for cond, cr in condition_results.items():
+        print(f"  {cond:20s} {cr['resolved']:3}/{total} ({cr['rate']*100:5.1f}%)")
 
-    delta = base_ctx["resolved"] - no_ctx["resolved"]
-    delta_rate = delta / total if total else 0.0
-
-    print(f"  no_context:       {no_ctx['resolved']:3}/{total} ({no_ctx['rate']*100:5.1f}%)")
-    print(f"  baseline_context: {base_ctx['resolved']:3}/{total} ({base_ctx['rate']*100:5.1f}%)")
-    print(f"  delta:            {delta:+3}/{total} ({delta_rate*100:+5.1f}%)")
+    # Compute delta only when both conditions are present
+    delta_info: dict | None = None
+    if "no_context" in condition_results and "baseline_context" in condition_results:
+        no_ctx = condition_results["no_context"]
+        base_ctx = condition_results["baseline_context"]
+        delta = base_ctx["resolved"] - no_ctx["resolved"]
+        delta_rate = delta / total if total else 0.0
+        delta_info = {"resolved": delta, "rate": delta_rate}
+        print(f"  {'delta':20s} {delta:+3}/{total} ({delta_rate*100:+5.1f}%)")
 
     # Write summary JSON
-    summary = {
+    summary: dict = {
         "group_id": group_id,
         "dataset": args.dataset_name,
         "split": args.split,
         "model": args.model,
+        "runner": args.runner,
+        "timeout_s": timeout_s,
         "instance_count": total,
         "conditions": condition_results,
-        "delta": {
-            "resolved": delta,
-            "rate": delta_rate,
-        },
     }
+    if delta_info is not None:
+        summary["delta"] = delta_info
 
     summary_path = RESULTS_DIR / group_id / "summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)

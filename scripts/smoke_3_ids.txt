@@ -1,0 +1,5 @@
+# Smoke test: 3 instances (1 astropy + 2 django) for EC2 pipeline validation.
+# Chosen as the first IDs from each repo for maximum harness coverage.
+astropy__astropy-12907
+django__django-10097
+django__django-10554

@@ -160,6 +160,12 @@ def main() -> None:
             "If omitted, a runner-specific default is used (120/300/600)."
         ),
     )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=40,
+        help="Max agent steps for mini_swe_agent_swebench (default: 40).",
+    )
 
     args = parser.parse_args()
 
@@ -268,6 +274,7 @@ def main() -> None:
                     "--ablation", condition,
                     "--runner", args.runner,
                     "--timeout_s", str(timeout_s),
+                    "--max_steps", str(args.max_steps),
                     "--run_id", run_id,
                     "--out", str(preds_path),
                     *dry_run_arg,

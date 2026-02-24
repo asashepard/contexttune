@@ -175,9 +175,16 @@ def main() -> int:
     else:
         print("✗ No patch generated (empty result)")
         print()
+        # Check for trajectory files that might have useful info
+        import glob
+        traj_files = glob.glob("/tmp/**/trajectory*.json", recursive=True)
+        if traj_files:
+            print(f"Trajectory file(s) found: {traj_files}")
+            print("The agent may have timed out before extracting a patch.")
+        print()
         print("Possible causes:")
         print("- Model did not produce a valid diff")
-        print("- Agent timed out")
+        print("- Agent timed out (try increasing --timeout_s)")
         print("- Docker environment issue")
         return 1
 

@@ -1,8 +1,10 @@
 """Docker-native SWE-agent runner using mini-swe-agent with SWE-bench Docker environment."""
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
+import queue
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,6 +22,10 @@ from context_policy.runner.patch_utils import (
     extract_diff,
     extract_patch_from_trajectory,
 )
+
+# Default step limit to prevent the agent from looping indefinitely.
+# Most SWE-bench fixes need <20 tool calls; 40 gives margin without runaway loops.
+DEFAULT_MAX_STEPS = 40
 
 
 def _get_instance_docker_image(instance: dict) -> str:
@@ -105,13 +111,12 @@ def _run_agent_in_docker(
     repo_dir: Path,
     traj_path: Path,
     result_queue: multiprocessing.Queue,
+    max_steps: int = DEFAULT_MAX_STEPS,
 ) -> None:
     """Run mini-swe-agent with DockerEnvironment in a subprocess.
 
     This function is designed to run in a separate process for timeout enforcement.
     Results are placed in result_queue as (patch_str, error_msg) tuple.
-
-    TODO: If minisweagent API changes, update imports and calls here.
     """
     try:
         # Import inside subprocess to isolate import errors
@@ -120,18 +125,24 @@ def _run_agent_in_docker(
         from minisweagent.models.litellm_model import LitellmModel
 
         # Create Docker environment pointing to the SWE-bench image
-        # DockerEnvironment expects image via config_class kwargs
         env = DockerEnvironment(image=image_name)
 
         # Create model instance
-        # Model name format for litellm is "openai/gpt-4" or similar
         model_instance = LitellmModel(model_name=model)
 
-        # Create agent with model and environment
-        agent = DefaultAgent(
-            model=model_instance,
-            env=env,
-        )
+        # Create agent with model, environment, and step limit.
+        # max_steps prevents infinite agent loops and bounds API cost.
+        agent_kwargs: dict[str, Any] = {
+            "model": model_instance,
+            "env": env,
+        }
+        # Pass max_steps if the API supports it (minisweagent >=1.15)
+        import inspect
+        sig = inspect.signature(DefaultAgent.__init__)
+        if "max_steps" in sig.parameters:
+            agent_kwargs["max_steps"] = max_steps
+
+        agent = DefaultAgent(**agent_kwargs)
 
         # Run agent with task - returns (patch, trajectory_json_str)
         patch, traj_json = agent.run(task)
@@ -158,12 +169,59 @@ def _run_agent_in_docker(
         result_queue.put(("", f"Agent error: {e}"))
 
 
+def _stop_orphan_containers() -> None:
+    """Stop any leftover minisweagent-* Docker containers."""
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "name=minisweagent-"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        container_ids = result.stdout.strip().split()
+        for cid in container_ids:
+            if cid:
+                subprocess.run(
+                    ["docker", "stop", cid],
+                    capture_output=True,
+                    timeout=15,
+                )
+    except Exception:
+        pass
+
+
+def _salvage_patch(traj_path: Path, result_queue: multiprocessing.Queue) -> str:
+    """Try to recover a patch from the trajectory file or queue after timeout/crash.
+
+    Returns the patch string, or "" if nothing found.
+    """
+    # Try the queue first — the process may have finished in the instant
+    # between timeout firing and us checking.
+    try:
+        patch, error = result_queue.get_nowait()
+        if patch and not error and len(patch) <= MAX_PATCH_SIZE:
+            print(f"  Salvaged patch from queue ({len(patch)} chars)")
+            return patch
+    except Exception:
+        pass
+
+    # Try trajectory file
+    if traj_path.exists():
+        patch = extract_patch_from_trajectory(str(traj_path))
+        if patch and len(patch) <= MAX_PATCH_SIZE:
+            print(f"  Salvaged patch from trajectory ({len(patch)} chars)")
+            return patch
+
+    return ""
+
+
 def generate_patch_with_mini_swebench(
     instance: dict,
     model: str,
     context_md: str | None = None,
     *,
     timeout_s: int = 600,
+    max_steps: int = DEFAULT_MAX_STEPS,
     traj_dir: Path | None = None,
 ) -> str:
     """Generate a patch using mini-swe-agent with SWE-bench Docker environment.
@@ -181,6 +239,7 @@ def generate_patch_with_mini_swebench(
         model: Model name for mini-swe-agent (e.g., "openai/gpt-4").
         context_md: Optional context to prepend to problem statement.
         timeout_s: Timeout for agent run in seconds (default 600 = 10 min).
+        max_steps: Maximum number of agent steps (default 40).
         traj_dir: Optional directory to save trajectory files.
 
     Returns:
@@ -225,7 +284,7 @@ def generate_patch_with_mini_swebench(
         result_queue: multiprocessing.Queue = multiprocessing.Queue()
         proc = multiprocessing.Process(
             target=_run_agent_in_docker,
-            args=(task, model, image_name, repo_dir, traj_path, result_queue),
+            args=(task, model, image_name, repo_dir, traj_path, result_queue, max_steps),
         )
         proc.start()
         proc.join(timeout=timeout_s)
@@ -238,35 +297,40 @@ def generate_patch_with_mini_swebench(
                 proc.kill()
                 proc.join()
             print(f"  mini-swe-agent-swebench timed out after {timeout_s}s")
-            return ""
+            # Stop orphaned Docker containers from the agent
+            _stop_orphan_containers()
+            # Try to salvage a patch from trajectory/queue even on timeout
+            return _salvage_patch(traj_path, result_queue)
 
-        # Get result from queue
-        if result_queue.empty():
-            print("  mini-swe-agent-swebench: no result returned")
-            return ""
-
-        patch, error = result_queue.get(timeout=1)
+        # Get result from queue (use .get with timeout, not .empty() which is unreliable)
+        try:
+            patch, error = result_queue.get(timeout=5)
+        except queue.Empty:
+            print("  mini-swe-agent-swebench: no result in queue")
+            # Process exited without putting result — try trajectory
+            return _salvage_patch(traj_path, result_queue)
 
         if error:
             print(f"  mini-swe-agent-swebench error: {error}")
-            return ""
+            # Even on error, trajectory might contain a partial patch
+            return _salvage_patch(traj_path, result_queue)
 
         # Try to extract patch from trajectory if agent didn't return it directly
         if not patch and traj_path.exists():
             patch = extract_patch_from_trajectory(str(traj_path))
 
         # Safety: reject oversized patches
-        if len(patch) > MAX_PATCH_SIZE:
+        if patch and len(patch) > MAX_PATCH_SIZE:
             print(f"  Patch too large ({len(patch)} chars), rejecting")
             return ""
 
-        return patch
+        return patch or ""
 
     except Exception as e:
         print(f"  mini-swe-agent-swebench error: {e}")
         return ""
     finally:
-        # Clean up temp trajectory file if we created one
+        # Clean up temp trajectory file if we created one (keep when traj_dir is set)
         if not traj_dir:
             try:
                 traj_path.unlink(missing_ok=True)

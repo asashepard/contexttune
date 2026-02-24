@@ -106,14 +106,8 @@ def _get_instance_docker_image(instance: dict) -> str:
     return fallback
 
 
-def _extract_diff_from_containers() -> str:
-    """Extract git diff from any running minisweagent Docker container.
-
-    SWE-bench containers have the repo at /testbed.  After the agent runs
-    commands inside the container we can extract whatever changes were made.
-    This is the most reliable way to get the patch — it doesn't depend on
-    the mini-swe-agent Python API return type at all.
-    """
+def _get_running_container_id() -> str | None:
+    """Get the container ID of any running minisweagent container."""
     try:
         result = subprocess.run(
             ["docker", "ps", "-q", "--filter", "name=minisweagent-"],
@@ -122,33 +116,81 @@ def _extract_diff_from_containers() -> str:
             timeout=10,
         )
         containers = result.stdout.strip().split()
-        if not containers:
-            return ""
+        return containers[0] if containers else None
+    except Exception:
+        return None
 
-        cid = containers[0]
-        # Try common repo locations in SWE-bench containers
-        for workdir in ["/testbed", "/workspace", "/repo"]:
-            # Try both unstaged and staged (HEAD) diffs
-            for diff_cmd in [
-                ["docker", "exec", "-w", workdir, cid, "git", "diff"],
-                ["docker", "exec", "-w", workdir, cid, "git", "diff", "HEAD"],
-            ]:
-                try:
-                    result = subprocess.run(
-                        diff_cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    if result.returncode == 0 and result.stdout.strip():
-                        diff = result.stdout.strip()
-                        cmd_label = " ".join(diff_cmd[-2:])
-                        print(f"  Extracted {cmd_label} from container {cid[:12]} at {workdir} ({len(diff)} chars)")
-                        return diff
-                except Exception:
-                    continue
+
+def _extract_diff_from_container(container_id: str) -> str:
+    """Extract git diff from a specific Docker container.
+
+    SWE-bench containers have the repo at /testbed.  After the agent runs
+    commands inside the container we can extract whatever changes were made.
+    This is the most reliable way to get the patch — it doesn't depend on
+    the mini-swe-agent Python API return type at all.
+    """
+    if not container_id:
+        print("  No container ID for diff extraction")
+        return ""
+
+    # Check if container is still running
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        running = result.stdout.strip().lower() == "true"
+        print(f"  Container {container_id[:12]} running: {running}")
+        if not running:
+            return ""
     except Exception as e:
-        print(f"  WARNING: container diff extraction failed: {e}")
+        print(f"  WARNING: container inspect failed: {e}")
+        return ""
+
+    # Try common repo locations in SWE-bench containers
+    for workdir in ["/testbed", "/workspace", "/repo"]:
+        # Try both unstaged and staged (HEAD) diffs
+        for diff_args in [["git", "diff"], ["git", "diff", "HEAD"]]:
+            try:
+                result = subprocess.run(
+                    ["docker", "exec", "-w", workdir, container_id] + diff_args,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    diff = result.stdout.strip()
+                    cmd_label = " ".join(diff_args)
+                    print(f"  Extracted '{cmd_label}' from container at {workdir} ({len(diff)} chars)")
+                    return diff
+            except Exception:
+                continue
+
+    # No diff found — check if the workdir even exists
+    for workdir in ["/testbed", "/workspace", "/repo"]:
+        try:
+            result = subprocess.run(
+                ["docker", "exec", container_id, "ls", "-la", workdir],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                print(f"  {workdir} exists but no git diff found")
+                # Try git status for debugging
+                result = subprocess.run(
+                    ["docker", "exec", "-w", workdir, container_id, "git", "status", "--short"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                print(f"  git status at {workdir}: {result.stdout.strip()[:200]}")
+        except Exception:
+            continue
+
+    print("  No diff found in any container workdir")
     return ""
 
 
@@ -168,13 +210,17 @@ def _run_agent_in_docker(
 
     mini-swe-agent 1.17 API (confirmed via introspection):
       - DefaultAgent(model, env, **kwargs)  → kwargs forwarded to AgentConfig
-      - AgentConfig(step_limit=0, cost_limit=3.0, ...)  → step_limit=0 means unlimited
+      - AgentConfig(step_limit=0, cost_limit=3.0, ...)
       - agent.run(task) -> tuple[str, str]  → (result_label, result_detail)
-      - Agent finishes when shell command outputs 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'
+      - DockerEnvironment starts container in __init__, cleans up in __del__
 
-    The agent makes changes inside the Docker container at /testbed.
-    We extract the patch via `docker exec git diff` from the container.
+    CRITICAL: The DockerEnvironment destroys the container when agent.run()
+    finishes (via __del__ or explicit cleanup). We must extract the diff
+    while the env object is still alive — i.e., before the function returns.
     """
+    container_id: str | None = None
+    env = None
+
     try:
         # Import inside subprocess to isolate import errors
         from minisweagent.agents.default import DefaultAgent
@@ -182,32 +228,40 @@ def _run_agent_in_docker(
         from minisweagent.models.litellm_model import LitellmModel
 
         # ---- Build components ----
+        # DockerEnvironment starts the container in __init__
         env = DockerEnvironment(image=image_name)
+
+        # Capture container ID immediately after env creation
+        container_id = _get_running_container_id()
+        print(f"  Container ID after env init: {container_id}")
+
         model_instance = LitellmModel(model_name=model)
 
-        # Pass step_limit to AgentConfig via **kwargs.
-        # step_limit=0 means unlimited in mini-swe-agent; we set it to 30.
-        print(f"  Creating agent: step_limit={step_limit}, image={image_name}")
+        # Pass step_limit AND cost_limit to AgentConfig via **kwargs.
+        # cost_limit default is $3 which may trigger LimitsExceeded prematurely.
+        print(f"  Creating agent: step_limit={step_limit}, cost_limit=0 (unlimited)")
         agent = DefaultAgent(
             model=model_instance,
             env=env,
             step_limit=step_limit,
+            cost_limit=0.0,  # disable cost limit; we control via step_limit + timeout
         )
 
         # ---- Run the agent ----
-        # run() -> tuple[str, str]: (result_label, result_detail)
-        # result_label is e.g. "TerminatingException" or completion text
-        # result_detail is the error message or completion output
         print(f"  Running agent on task ({len(task)} chars)...")
         result_label, result_detail = agent.run(task)
         print(f"  Agent finished: label={result_label!r}, detail_len={len(result_detail)}")
 
-        # ---- Extract patch from Docker container (most reliable) ----
-        # The agent modifies files in /testbed inside the container.
-        # `git diff` gives us exactly what changed.
-        patch = _extract_diff_from_containers()
+        # ---- Extract diff IMMEDIATELY, before env/container is destroyed ----
+        # Re-check container ID (should be same, but just in case)
+        current_cid = _get_running_container_id() or container_id
+        print(f"  Container ID post-run: {current_cid}")
 
-        # If container diff failed, check if the agent returned a patch directly
+        patch = ""
+        if current_cid:
+            patch = _extract_diff_from_container(current_cid)
+
+        # Fallback: check if agent returned a diff in result_detail
         if not patch and result_detail:
             patch = extract_diff(result_detail)
             if patch:
@@ -215,13 +269,22 @@ def _run_agent_in_docker(
 
         # ---- Save trajectory / agent output for debugging ----
         try:
-            traj_data = {
+            # Try to capture agent's message history
+            messages = getattr(agent, "messages", None)
+            if messages is None:
+                messages = getattr(agent, "history", None)
+
+            traj_data: dict[str, Any] = {
                 "result_label": result_label,
                 "result_detail": result_detail,
                 "patch_len": len(patch) if patch else 0,
+                "container_id": container_id,
             }
+            if messages:
+                traj_data["messages"] = messages
+
             with open(traj_path, "w", encoding="utf-8") as f:
-                json.dump(traj_data, f, indent=2)
+                json.dump(traj_data, f, indent=2, default=str)
             print(f"  Saved agent output to {traj_path}")
         except Exception as e:
             print(f"  WARNING: failed to save trajectory: {e}")
@@ -240,7 +303,10 @@ def _run_agent_in_docker(
         tb_str = traceback.format_exc()
         print(f"  Agent error: {e}\n{tb_str}")
         # Even on error, try to recover diff from the container
-        fallback = _extract_diff_from_containers()
+        fallback = ""
+        cid = _get_running_container_id() or container_id
+        if cid:
+            fallback = _extract_diff_from_container(cid)
         result_queue.put(
             (fallback, f"Agent error: {e}" if not fallback else None)
         )
@@ -367,7 +433,8 @@ def generate_patch_with_mini_swebench(
         proc.join(timeout=timeout_s)
 
         if proc.is_alive():
-            # Timeout: terminate the Python process
+            # Timeout: terminate the Python process but container stays alive
+            # (started with 'sleep 2h', process kill doesn't docker-stop it)
             proc.terminate()
             proc.join(timeout=5)
             if proc.is_alive():
@@ -375,10 +442,11 @@ def generate_patch_with_mini_swebench(
                 proc.join()
             print(f"  mini-swe-agent-swebench timed out after {timeout_s}s")
 
-            # CRITICAL: extract diff from the Docker container BEFORE stopping it.
-            # The container is still running (started with 'sleep 2h') and holds
-            # whatever file changes the agent made during its run.
-            container_patch = _extract_diff_from_containers()
+            # CRITICAL: extract diff from Docker container BEFORE stopping it.
+            cid = _get_running_container_id()
+            container_patch = ""
+            if cid:
+                container_patch = _extract_diff_from_container(cid)
 
             # Now stop orphaned Docker containers
             _stop_orphan_containers()

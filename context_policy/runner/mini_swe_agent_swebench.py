@@ -151,8 +151,8 @@ def _extract_diff_from_container(container_id: str) -> str:
 
     # Try common repo locations in SWE-bench containers
     for workdir in ["/testbed", "/workspace", "/repo"]:
-        # Try both unstaged and staged (HEAD) diffs
-        for diff_args in [["git", "diff"], ["git", "diff", "HEAD"]]:
+        # Try unstaged, staged (--cached), and all-vs-HEAD diffs
+        for diff_args in [["git", "diff"], ["git", "diff", "--cached"], ["git", "diff", "HEAD"]]:
             try:
                 result = subprocess.run(
                     ["docker", "exec", "-w", workdir, container_id] + diff_args,
@@ -223,13 +223,41 @@ def _run_agent_in_docker(
 
     try:
         # Import inside subprocess to isolate import errors
+        import yaml
         from minisweagent.agents.default import DefaultAgent
+        from minisweagent.config import get_config_path
         from minisweagent.environments.docker import DockerEnvironment
         from minisweagent.models.litellm_model import LitellmModel
 
+        # ---- Load SWE-bench config shipped with mini-swe-agent ----
+        # This config contains the prompts that instruct the agent to edit
+        # files in /testbed and submit with `git add -A && git diff --cached`.
+        # Without it, the agent uses bare defaults that don't produce patches.
+        swebench_config: dict = {}
+        try:
+            cfg_path = get_config_path("swebench")
+            swebench_config = yaml.safe_load(cfg_path.read_text()) or {}
+            print(f"  Loaded SWE-bench config from {cfg_path}")
+        except Exception as exc:
+            print(f"  WARNING: could not load swebench.yaml: {exc}")
+
+        agent_kwargs = dict(swebench_config.get("agent", {}))
+        env_config = dict(swebench_config.get("environment", {}))
+
         # ---- Build components ----
-        # DockerEnvironment starts the container in __init__
-        env = DockerEnvironment(image=image_name)
+        # DockerEnvironment starts the container in __init__.
+        # Pass cwd and env from swebench config for proper /testbed workdir.
+        env_cwd = env_config.get("cwd", "/testbed")
+        env_vars = env_config.get("env", {})
+        # Remove keys that DockerEnvironmentConfig doesn't accept
+        # (e.g. environment_class, forward_env if not in config)
+        env_config.pop("environment_class", None)
+
+        env = DockerEnvironment(
+            image=image_name,
+            cwd=env_cwd,
+            env=env_vars,
+        )
 
         # Capture container ID immediately after env creation
         container_id = _get_running_container_id()
@@ -237,14 +265,17 @@ def _run_agent_in_docker(
 
         model_instance = LitellmModel(model_name=model)
 
-        # Pass step_limit AND cost_limit to AgentConfig via **kwargs.
+        # Override step_limit and cost_limit with our experiment values.
         # cost_limit default is $3 which may trigger LimitsExceeded prematurely.
+        agent_kwargs["step_limit"] = step_limit
+        agent_kwargs["cost_limit"] = 0.0  # disable; we control via step_limit + timeout
+
         print(f"  Creating agent: step_limit={step_limit}, cost_limit=0 (unlimited)")
+        print(f"  Agent config keys: {sorted(agent_kwargs.keys())}")
         agent = DefaultAgent(
             model=model_instance,
             env=env,
-            step_limit=step_limit,
-            cost_limit=0.0,  # disable cost limit; we control via step_limit + timeout
+            **agent_kwargs,
         )
 
         # ---- Run the agent ----

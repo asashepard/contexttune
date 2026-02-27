@@ -28,6 +28,15 @@ Thumbs.db
 
 # Logs
 *.log
+slurm-*.out
+slurm-*.err
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Local config (secrets, API keys)
 .env

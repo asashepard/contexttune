@@ -43,6 +43,22 @@ To reset signals:
 rm -rf artifacts/signals
 ```
 
+Direct hard trim (retains summary snapshots only):
+```bash
+python scripts/hard_trim_repo.py --keep_summaries
+```
+
+Aggressive default (delete all generated artifacts/results):
+```bash
+python scripts/hard_trim_repo.py
+bash scripts/trim_delete.sh
+```
+
+PowerShell wrapper:
+```powershell
+./scripts/trim_delete.ps1
+```
+
 ## Determinism Rules
 
 - **Sorted lists**: All list outputs are sorted alphabetically.

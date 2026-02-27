@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
+from context_policy.context_gen.baseline import (
+    generate_context,
+    generate_context_dry_run,
+    write_context,
+)
+from context_policy.datasets.swebench import load_instances
 from context_policy.datasets.swesmith_adapter import generate_swesmith_tasks, import_swesmith_tasks
 from context_policy.loop.contracts import LoopState, RoundState, read_loop_state, write_loop_state
 from context_policy.policy.state import default_policy, load_policy, write_policy
@@ -15,19 +22,157 @@ from context_policy.report.summarize import (
     load_results,
     summarize_failure_taxonomy,
 )
-from context_policy.utils.paths import PREDS_DIR, PROJECT_ROOT, RESULTS_DIR
+from context_policy.runner.mini_swe_agent import generate_patch_with_mini
+from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench
+from context_policy.runner.single_shot import generate_patch
+from context_policy.utils.jsonl import read_jsonl
+from context_policy.utils.paths import PREDS_DIR, PROJECT_ROOT, RESULTS_DIR, repo_to_dirname
 from context_policy.utils.subproc import run as subproc_run
 
 
-def _run_step(name: str, cmd: list[str], logs_dir: Path) -> int:
+def _run_step(name: str, cmd: list[str], logs_dir: Path, timeout_s: int = 1800) -> int:
+    """Run an external command (eval scripts only)."""
     stdout_log = logs_dir / f"{name}.stdout.log"
     stderr_log = logs_dir / f"{name}.stderr.log"
-    return subproc_run(cmd, cwd=PROJECT_ROOT, stdout_path=stdout_log, stderr_path=stderr_log)
+    return subproc_run(cmd, cwd=PROJECT_ROOT, stdout_path=stdout_log, stderr_path=stderr_log, timeout_s=timeout_s)
 
 
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# In-process context build
+# ---------------------------------------------------------------------------
+
+def _build_contexts(
+    *,
+    instances: list[dict],
+    policy: dict,
+    model: str,
+    contexts_root: Path,
+    round_id: str | None = None,
+    source_task_batch: str | None = None,
+    timeout_s: int = 120,
+    dry_run: bool = False,
+) -> int:
+    """Build context artifacts for all instances in-process.
+
+    Returns:
+        Number of contexts successfully built.
+    """
+    success = 0
+    for instance in instances:
+        instance_id = instance["instance_id"]
+        repo = instance["repo"]
+        commit = instance["base_commit"]
+        repo_dirname = repo_to_dirname(repo)
+
+        json_path = contexts_root / repo_dirname / commit / instance_id / "context.json"
+        md_path = contexts_root / repo_dirname / commit / instance_id / "context.md"
+
+        try:
+            if dry_run:
+                ctx = generate_context_dry_run(
+                    instance, policy=policy,
+                    round_id=round_id, source_task_batch=source_task_batch,
+                )
+            else:
+                ctx = generate_context(
+                    instance, policy=policy, model=model,
+                    round_id=round_id, source_task_batch=source_task_batch,
+                    timeout_s=timeout_s,
+                )
+            write_context(ctx, json_path, md_path)
+            success += 1
+        except Exception as exc:
+            print(f"  Context build error for {instance_id}: {exc}", file=sys.stderr)
+    return success
+
+
+# ---------------------------------------------------------------------------
+# In-process inference
+# ---------------------------------------------------------------------------
+
+def _load_context_md(contexts_root: Path, repo: str, commit: str, instance_id: str) -> str:
+    """Load context.md for an instance, return empty string if missing."""
+    md_path = contexts_root / repo_to_dirname(repo) / commit / instance_id / "context.md"
+    if md_path.exists():
+        return md_path.read_text(encoding="utf-8")
+    return ""
+
+
+def _run_inference(
+    *,
+    instances: list[dict],
+    model: str,
+    runner: str,
+    contexts_root: Path,
+    preds_path: Path,
+    logs_dir: Path,
+    timeout_s: int,
+    step_limit: int,
+    dry_run: bool = False,
+) -> None:
+    """Run inference for all instances in-process, appending to preds_path."""
+    # Resume support
+    completed_ids: set[str] = set()
+    if preds_path.exists():
+        completed_ids = {r["instance_id"] for r in read_jsonl(preds_path)}
+
+    preds_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for i, instance in enumerate(instances):
+        instance_id = instance["instance_id"]
+        if instance_id in completed_ids:
+            continue
+
+        context_md = _load_context_md(
+            contexts_root, instance["repo"], instance["base_commit"], instance_id,
+        )
+
+        try:
+            if dry_run:
+                patch = ""
+            elif runner == "single_shot":
+                patch = generate_patch(
+                    instance=instance, model=model,
+                    context_md=context_md or None,
+                    temperature=0.0, top_p=1.0, max_tokens=1024,
+                    timeout_s=timeout_s,
+                )
+            elif runner == "mini_swe_agent":
+                patch = generate_patch_with_mini(
+                    instance=instance, model=model,
+                    context_md=context_md or None,
+                    timeout_s=timeout_s, cost_limit=0.0,
+                )
+            elif runner == "mini_swe_agent_swebench":
+                patch = generate_patch_with_mini_swebench(
+                    instance=instance, model=model,
+                    context_md=context_md or None,
+                    timeout_s=timeout_s,
+                    traj_dir=logs_dir / "trajectories",
+                    step_limit=step_limit,
+                )
+            else:
+                raise ValueError(f"Unknown runner: {runner}")
+        except Exception as exc:
+            print(f"  Inference error for {instance_id}: {exc}", file=sys.stderr)
+            patch = ""
+
+        record = {
+            "instance_id": instance_id,
+            "model_name_or_path": model,
+            "model_patch": patch,
+        }
+        line = json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n"
+        with preds_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+
+        status = "OK" if patch else "EMPTY"
+        print(f"  [{i+1}/{len(instances)}] {instance_id} -> {status}")
 
 
 def run_adaptive_loop(
@@ -47,6 +192,7 @@ def run_adaptive_loop(
     split: str,
     policy_file: str | None,
     force: bool,
+    dry_run: bool = False,
 ) -> Path:
     loop_root = RESULTS_DIR / loop_id
     logs_root = loop_root / "logs"
@@ -66,7 +212,7 @@ def run_adaptive_loop(
             loop_id=loop_id,
             model=model,
             runner=runner,
-            created_at=datetime.utcnow().isoformat(),
+            created_at=datetime.now(timezone.utc).isoformat(),
             rounds=[],
         )
 
@@ -112,62 +258,73 @@ def run_adaptive_loop(
         baseline_contexts_root = contexts_base / "baseline"
         tuned_contexts_root = contexts_base / "tuned"
 
-        build_baseline_context_cmd = [
-            "python", "scripts/build_context.py",
-            "--dataset_name", dataset_name,
-            "--split", split,
-            "--tasks_file", str(round_tasks_file),
-            "--mode", "baseline",
-            "--contexts_root", str(baseline_contexts_root),
-            "--round_id", round_id,
-            "--source_task_batch", str(round_tasks_file),
-        ]
-        if _run_step(f"r{round_index:02d}_build_context_baseline", build_baseline_context_cmd, round_logs) != 0:
-            raise RuntimeError(f"Round {round_index} baseline context build failed")
+        # Load instances for this round
+        instances = load_instances(
+            dataset_name=dataset_name,
+            split=split,
+            tasks_file=str(round_tasks_file),
+        )
+        print(f"Round {round_index}: loaded {len(instances)} instances")
 
-        build_tuned_context_cmd = [
-            "python", "scripts/build_context.py",
-            "--dataset_name", dataset_name,
-            "--split", split,
-            "--tasks_file", str(round_tasks_file),
-            "--mode", "tuned",
-            "--policy_file", str(policy_path),
-            "--contexts_root", str(tuned_contexts_root),
-            "--round_id", round_id,
-            "--source_task_batch", str(round_tasks_file),
-        ]
-        if _run_step(f"r{round_index:02d}_build_context_tuned", build_tuned_context_cmd, round_logs) != 0:
-            raise RuntimeError(f"Round {round_index} tuned context build failed")
+        # Build contexts in-process
+        baseline_policy = default_policy()
+        baseline_policy["policy_version"] = "baseline"
+
+        print(f"Round {round_index}: building baseline contexts...")
+        baseline_ok = _build_contexts(
+            instances=instances,
+            policy=baseline_policy,
+            model=model,
+            contexts_root=baseline_contexts_root,
+            round_id=round_id,
+            source_task_batch=str(round_tasks_file),
+            timeout_s=timeout_s,
+            dry_run=dry_run,
+        )
+        print(f"  baseline contexts built: {baseline_ok}/{len(instances)}")
+
+        print(f"Round {round_index}: building tuned contexts...")
+        tuned_ok = _build_contexts(
+            instances=instances,
+            policy=current_policy,
+            model=model,
+            contexts_root=tuned_contexts_root,
+            round_id=round_id,
+            source_task_batch=str(round_tasks_file),
+            timeout_s=timeout_s,
+            dry_run=dry_run,
+        )
+        print(f"  tuned contexts built: {tuned_ok}/{len(instances)}")
 
         round_results: dict[str, dict] = {}
 
         for condition in conditions:
             cond_run_id = f"{round_id}__{condition}"
             preds_path = PREDS_DIR / loop_id / f"r{round_index:02d}" / condition / "preds.jsonl"
+            cond_logs = logs_root / round_id / condition
 
-            infer_cmd = [
-                "python", "scripts/run_inference.py",
-                "--dataset_name", dataset_name,
-                "--split", split,
-                "--tasks_file", str(round_tasks_file),
-                "--model", model,
-                "--ablation", condition,
-                "--runner", runner,
-                "--timeout_s", str(timeout_s),
-                "--step_limit", str(step_limit),
-                "--run_id", cond_run_id,
-                "--out", str(preds_path),
-            ]
             if condition == "baseline":
-                infer_cmd.extend(["--contexts_root", str(baseline_contexts_root)])
+                cond_contexts_root = baseline_contexts_root
             elif condition == "tuned":
-                infer_cmd.extend(["--contexts_root", str(tuned_contexts_root)])
+                cond_contexts_root = tuned_contexts_root
             else:
                 raise ValueError(f"Unsupported condition: {condition}. Expected baseline,tuned")
 
-            if _run_step(f"r{round_index:02d}_infer_{condition}", infer_cmd, round_logs) != 0:
-                raise RuntimeError(f"Round {round_index} inference failed for {condition}")
+            # Run inference in-process
+            print(f"Round {round_index}: running inference ({condition})...")
+            _run_inference(
+                instances=instances,
+                model=model,
+                runner=runner,
+                contexts_root=cond_contexts_root,
+                preds_path=preds_path,
+                logs_dir=cond_logs,
+                timeout_s=timeout_s,
+                step_limit=step_limit,
+                dry_run=dry_run,
+            )
 
+            # Evaluation (external — needs Docker/SWE-bench harness)
             eval_cmd = [
                 "bash", "scripts/run_swebench_eval.sh",
                 dataset_name,
@@ -175,7 +332,9 @@ def run_adaptive_loop(
                 cond_run_id,
                 str(max_workers_eval),
             ]
-            if _run_step(f"r{round_index:02d}_eval_{condition}", eval_cmd, round_logs) != 0:
+            round_logs = logs_root / round_id
+            round_logs.mkdir(parents=True, exist_ok=True)
+            if _run_step(f"r{round_index:02d}_eval_{condition}", eval_cmd, round_logs, timeout_s=3600) != 0:
                 print(f"Warning: evaluation failed for condition {condition}")
 
             cond_results_dir = RESULTS_DIR / cond_run_id

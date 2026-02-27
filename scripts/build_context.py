@@ -10,7 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from context_policy.context_gen.baseline import (
-    build_task_context_with_policy,
+    generate_context,
+    generate_context_dry_run,
     write_context,
 )
 from context_policy.datasets.swebench import load_instances, read_instance_ids
@@ -82,6 +83,16 @@ def main() -> None:
         default=None,
         help="Optional task batch source metadata field.",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model name for LLM context generation.",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Skip LLM calls; emit placeholder context.",
+    )
 
     args = parser.parse_args()
     contexts_root = Path(args.contexts_root)
@@ -121,9 +132,9 @@ def main() -> None:
         commit = instance["base_commit"]
         repo_dirname = repo_to_dirname(repo)
 
-        # Output paths
-        json_path = contexts_root / repo_dirname / commit / "context.json"
-        md_path = contexts_root / repo_dirname / commit / "context.md"
+        # Output paths (include instance_id to prevent collisions)
+        json_path = contexts_root / repo_dirname / commit / instance_id / "context.json"
+        md_path = contexts_root / repo_dirname / commit / instance_id / "context.md"
 
         # Skip if exists (unless --force)
         if md_path.exists() and not args.force:
@@ -134,20 +145,29 @@ def main() -> None:
         print(f"[{i+1}/{len(instances)}] {instance_id} - processing...")
 
         try:
-            # Build context directly from task metadata + policy
-            context = build_task_context_with_policy(
-                instance,
-                policy=policy,
-                round_id=args.round_id,
-                source_task_batch=args.source_task_batch,
-            )
+            # Build context via LLM (or dry-run placeholder)
+            if args.dry_run or not args.model:
+                context = generate_context_dry_run(
+                    instance,
+                    policy=policy,
+                    round_id=args.round_id,
+                    source_task_batch=args.source_task_batch,
+                )
+            else:
+                context = generate_context(
+                    instance,
+                    policy=policy,
+                    model=args.model,
+                    round_id=args.round_id,
+                    source_task_batch=args.source_task_batch,
+                )
 
             # Write outputs
             write_context(context, json_path, md_path)
 
             # Summary
-            total_chars = sum(len(c["body"]) for c in context["cards"])
-            print(f"  -> wrote context.md ({total_chars} chars, {len(context['cards'])} cards)")
+            total_chars = len(context.get("body", ""))
+            print(f"  -> wrote context.md ({total_chars} chars)")
             success_count += 1
 
         except Exception as e:

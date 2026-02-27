@@ -7,24 +7,6 @@ import json
 
 
 @dataclass
-class TaskInstance:
-    instance_id: str
-    repo: str
-    base_commit: str
-    problem_statement: str
-    version: str | None = None
-    environment_setup_commit: str | None = None
-    source: str | None = None
-    metadata: dict | None = None
-
-
-@dataclass
-class PolicyVersion:
-    version: str
-    policy_file: str
-
-
-@dataclass
 class RoundState:
     round_index: int
     round_id: str

@@ -42,6 +42,7 @@ def main() -> None:
     parser.add_argument("--policy_file", default=None, help="Initial policy JSON file.")
     parser.add_argument("--loop_id", default=None, help="Loop run ID.")
     parser.add_argument("--force", action="store_true", help="Force rerun rounds even if loop_state exists.")
+    parser.add_argument("--dry_run", action="store_true", help="Skip LLM/model calls; emit placeholder context and empty patches.")
 
     args = parser.parse_args()
 
@@ -67,6 +68,7 @@ def main() -> None:
         split=args.split,
         policy_file=args.policy_file,
         force=args.force,
+        dry_run=args.dry_run,
     )
 
     print(f"Adaptive loop complete. State: {state_path}")

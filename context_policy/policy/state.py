@@ -4,30 +4,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-DEFAULT_CARD_ORDER = [
-    "issue_focus",
-    "fix_plan",
-    "validation",
-    "editing_norms",
-]
+_DEFAULT_CONTEXT_PROMPT = """\
+Given the issue description, produce a concise context document that will help a coding agent fix the bug. Include:
+1. A focused summary of the issue (symptoms, expected vs actual behaviour).
+2. A concrete fix plan: which files/functions to change and how.
+3. Validation steps: which tests to run and what to check.
+4. Editing norms: make the smallest correct change, follow existing style, avoid unrelated edits.
+Stay within the character budget. Be specific, not generic."""
 
 
 def default_policy() -> dict:
     return {
         "policy_version": "v0",
-        "description": "Deterministic baseline context policy.",
+        "description": "Baseline context policy.",
         "total_char_budget": 3200,
-        "card_order": list(DEFAULT_CARD_ORDER),
-        "cards": {
-            "issue_focus": {"enabled": True, "max_chars": 1200, "priority": 0.98},
-            "fix_plan": {"enabled": True, "max_chars": 900, "priority": 0.9},
-            "validation": {"enabled": True, "max_chars": 700, "priority": 0.85},
-            "editing_norms": {"enabled": True, "max_chars": 500, "priority": 0.75},
-        },
-        "llm_rewrite_instruction": (
-            "Return JSON only. Tune card order, enabled flags, and max_chars to improve "
-            "resolved rate while staying within total_char_budget."
-        ),
+        "context_prompt": _DEFAULT_CONTEXT_PROMPT,
     }
 
 

@@ -14,6 +14,7 @@ def run(
     env: dict[str, str] | None = None,
     stdout_path: str | Path | None = None,
     stderr_path: str | Path | None = None,
+    timeout_s: int | None = 1800,
 ) -> int:
     """Run a command, streaming stdout/stderr to files.
 
@@ -23,16 +24,15 @@ def run(
         env: Environment variables (merged with current env if provided).
         stdout_path: Path to write stdout. Created if needed.
         stderr_path: Path to write stderr. Created if needed.
+        timeout_s: Timeout in seconds (default 1800). None = no timeout.
 
     Returns:
-        The process return code.
+        The process return code (non-zero on timeout).
     """
-    # Prepare environment
     run_env: dict[str, str] | None = None
     if env is not None:
         run_env = {**os.environ, **env}
 
-    # Ensure output directories exist
     if stdout_path:
         stdout_path = Path(stdout_path)
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +40,6 @@ def run(
         stderr_path = Path(stderr_path)
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Open files for streaming
     stdout_file: Any = None
     stderr_file: Any = None
     try:
@@ -53,11 +52,16 @@ def run(
             cmd,
             cwd=cwd,
             env=run_env,
-            stdout=stdout_file if stdout_file else subprocess.PIPE,
-            stderr=stderr_file if stderr_file else subprocess.PIPE,
+            stdout=stdout_file if stdout_file else subprocess.DEVNULL,
+            stderr=stderr_file if stderr_file else subprocess.DEVNULL,
             text=True,
         )
-        proc.wait()
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return 124  # conventional timeout exit code
         return proc.returncode
     finally:
         if stdout_file:

@@ -15,7 +15,7 @@ from context_policy.runner.mini_swe_agent import generate_patch_with_mini
 from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench
 from context_policy.runner.single_shot import generate_patch
 from context_policy.utils.jsonl import read_jsonl
-from context_policy.utils.paths import CONTEXTS_DIR, LOGS_DIR, PREDS_DIR, get_context_path
+from context_policy.utils.paths import LOGS_DIR, PREDS_DIR
 from context_policy.utils.run_id import make_run_id
 
 
@@ -53,15 +53,16 @@ def write_instance_log(
         f.write(diff_preview + "\n")
 
 
-def load_context(contexts_root: Path, repo: str, commit: str) -> str:
+def load_context(contexts_root: Path, repo: str, commit: str, instance_id: str) -> str:
     """Load context file if it exists."""
-    context_path = get_context_path(repo, commit)
-    # Allow override via contexts_root if different from default
-    if contexts_root != CONTEXTS_DIR:
-        from context_policy.utils.paths import repo_to_dirname
-        context_path = contexts_root / repo_to_dirname(repo) / commit / "context.md"
-    if context_path.exists():
-        return context_path.read_text(encoding="utf-8")
+    from context_policy.utils.paths import repo_to_dirname
+    # Try instance-specific path first, then fall back to legacy path
+    instance_path = contexts_root / repo_to_dirname(repo) / commit / instance_id / "context.md"
+    if instance_path.exists():
+        return instance_path.read_text(encoding="utf-8")
+    legacy_path = contexts_root / repo_to_dirname(repo) / commit / "context.md"
+    if legacy_path.exists():
+        return legacy_path.read_text(encoding="utf-8")
     return ""
 
 
@@ -230,7 +231,7 @@ def main() -> None:
 
         # Determine context
         context_md: str | None = None
-        context_md = load_context(contexts_root, instance["repo"], instance["base_commit"])
+        context_md = load_context(contexts_root, instance["repo"], instance["base_commit"], instance_id)
         if context_md:
             print(f"  Loaded context: {len(context_md)} chars")
         else:

@@ -8,5 +8,6 @@ version = "0.0.0"
 requires-python = ">=3.11"
 dependencies = []
 
-[tool.setuptools]
-packages = ["context_policy"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["context_policy*"]

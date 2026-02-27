@@ -58,7 +58,7 @@ def chat_completion(
         "max_tokens": max_tokens,
     }
 
-    max_retries = 2
+    max_retries = 4
     last_error = None
 
     for attempt in range(max_retries):
@@ -75,6 +75,10 @@ def chat_completion(
         except requests.RequestException as e:
             last_error = e
             if attempt < max_retries - 1:
-                time.sleep(0.5)
+                # Exponential backoff; extra wait on rate-limit
+                wait = 2 ** attempt
+                if hasattr(e, "response") and getattr(e.response, "status_code", 0) == 429:
+                    wait = max(wait, 10)
+                time.sleep(wait)
 
     raise RuntimeError(f"Chat completion failed after {max_retries} attempts: {last_error}")

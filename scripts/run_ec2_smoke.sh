@@ -69,7 +69,7 @@ echo "  Timeout:   ${TIMEOUT_S}s per instance"
 echo "  Max steps: $STEP_LIMIT"
 echo ""
 
-echo "[1/6] Checking prerequisites..."
+echo "[1/5] Checking prerequisites..."
 python -c "from minisweagent.agents.default import DefaultAgent" 2>/dev/null \
   && echo "  ✓ mini-swe-agent" \
   || { echo "  ✗ mini-swe-agent not installed"; exit 1; }
@@ -84,26 +84,22 @@ docker info >/dev/null 2>&1 \
   || { echo "  ✗ OPENAI_API_KEY not set"; exit 1; }
 echo ""
 
-# ── Build signals & context ──
-echo "[2/6] Building signals (skip if exist)..."
-python scripts/build_signals.py --instance_ids_file "$IDS_FILE"
-echo ""
-
-echo "[3/6] Building context (skip if exist)..."
-python scripts/build_context.py --instance_ids_file "$IDS_FILE"
+# ── Build context ──
+echo "[2/5] Building baseline context (skip if exist)..."
+python scripts/build_context.py --instance_ids_file "$IDS_FILE" --mode baseline
 echo ""
 
 # ── Build Docker images ──
-echo "[4/6] Building Docker images (skip if exist)..."
+echo "[3/5] Building Docker images (skip if exist)..."
 python scripts/build_docker_images.py --instance_ids_file "$IDS_FILE"
 echo ""
 
 # ── Run inference ──
-echo "[5/6] Running inference..."
+echo "[4/5] Running inference..."
 python scripts/run_inference.py \
   --model "$MODEL" \
   --runner mini_swe_agent_swebench \
-  --ablation baseline_context \
+  --ablation baseline \
   --instance_ids_file "$IDS_FILE" \
   --timeout_s "$TIMEOUT_S" \
   --step_limit "$STEP_LIMIT"
@@ -113,7 +109,7 @@ echo ""
 RUN_ID=$(ls -t artifacts/preds/ | head -1)
 PREDS_PATH="artifacts/preds/$RUN_ID/preds.jsonl"
 
-echo "[6/6] Running SWE-bench evaluation..."
+echo "[5/5] Running SWE-bench evaluation..."
 echo "  Run ID: $RUN_ID"
 echo "  Preds:  $PREDS_PATH"
 

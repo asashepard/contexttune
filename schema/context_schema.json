@@ -49,6 +49,18 @@
           }
         }
       }
+    },
+    "policy_version": {
+      "type": "string",
+      "description": "Context policy version used for card selection/tuning."
+    },
+    "round_id": {
+      "type": "string",
+      "description": "Adaptive loop round identifier."
+    },
+    "source_task_batch": {
+      "type": "string",
+      "description": "Path or identifier of source task batch used in this round."
     }
   }
 }

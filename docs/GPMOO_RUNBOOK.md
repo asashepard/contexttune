@@ -71,7 +71,7 @@ Run this exact order:
 
 1. Preflight checks (short job)
 2. Smoke run on 3 IDs
-3. Mini baseline condition jobs (`no_context` and `baseline_context`)
+3. Mini condition jobs (`baseline` and `tuned`)
 4. Eval jobs for each condition
 5. Summarize and compare
 
@@ -92,8 +92,8 @@ sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_TAG="gpmoo_smoke" slurm/run_
 Submit one job per condition:
 
 ```bash
-sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_ID="verified_mini_gpmoo_001",CONDITION="no_context" slurm/run_mini_condition.sh
-sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_ID="verified_mini_gpmoo_001",CONDITION="baseline_context" slurm/run_mini_condition.sh
+sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_ID="verified_mini_gpmoo_001",CONDITION="baseline" slurm/run_mini_condition.sh
+sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_ID="verified_mini_gpmoo_001",CONDITION="tuned" slurm/run_mini_condition.sh
 ```
 
 ### 5.4 Eval Jobs
@@ -101,8 +101,8 @@ sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_ID="verified_mini_gpmoo_001"
 Submit one eval per condition after inference files exist:
 
 ```bash
-sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="no_context",DATASET_NAME="princeton-nlp/SWE-bench_Verified" slurm/run_eval_condition.sh
-sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="baseline_context",DATASET_NAME="princeton-nlp/SWE-bench_Verified" slurm/run_eval_condition.sh
+sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="baseline",DATASET_NAME="princeton-nlp/SWE-bench_Verified" slurm/run_eval_condition.sh
+sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="tuned",DATASET_NAME="princeton-nlp/SWE-bench_Verified" slurm/run_eval_condition.sh
 ```
 
 ## 5.5 One-Command 4-Instance Sanity Run
@@ -116,7 +116,7 @@ bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2
 To run both conditions:
 
 ```bash
-bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline_context,no_context
+bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline,tuned
 ```
 
 IDs are read from `scripts/easy_4_ids.txt` by default.

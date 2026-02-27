@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Example:
 #   bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2
-#   bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline_context,no_context
+#   bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline,tuned
 
 MODEL=""
 IDS_FILE="scripts/easy_4_ids.txt"
@@ -16,7 +16,7 @@ RUNNER="mini_swe_agent_swebench"
 TIMEOUT_S=1200
 STEP_LIMIT=50
 MAX_WORKERS_EVAL=1
-CONDITIONS="baseline_context"
+CONDITIONS="baseline,tuned"
 RUN_TAG="smoke4"
 
 while [[ $# -gt 0 ]]; do
@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$MODEL" ]]; then
-  echo "Usage: bash scripts/run_smoke4_eval.sh --model openai/<model> [--conditions baseline_context,no_context]"
+  echo "Usage: bash scripts/run_smoke4_eval.sh --model openai/<model> [--conditions baseline,tuned]"
   exit 2
 fi
 
@@ -81,23 +81,29 @@ echo "Runner: $RUNNER"
 echo "Run base: $RUN_ID_BASE"
 echo
 
-echo "[1/4] Building signals"
-python scripts/build_signals.py \
-  --dataset_name "$DATASET_NAME" \
-  --split "$SPLIT" \
-  --instance_ids_file "$IDS_FILE"
+echo "[1/3] Preparing contexts"
+BASELINE_CTX_ROOT="artifacts/contexts/${RUN_ID_BASE}/baseline"
+TUNED_CTX_ROOT="artifacts/contexts/${RUN_ID_BASE}/tuned"
 
-echo "[2/4] Building context"
 python scripts/build_context.py \
   --dataset_name "$DATASET_NAME" \
   --split "$SPLIT" \
-  --instance_ids_file "$IDS_FILE"
+  --instance_ids_file "$IDS_FILE" \
+  --mode baseline \
+  --contexts_root "$BASELINE_CTX_ROOT"
+
+python scripts/build_context.py \
+  --dataset_name "$DATASET_NAME" \
+  --split "$SPLIT" \
+  --instance_ids_file "$IDS_FILE" \
+  --mode tuned \
+  --contexts_root "$TUNED_CTX_ROOT"
 
 IFS=',' read -r -a CONDITION_LIST <<< "$CONDITIONS"
 
 for CONDITION in "${CONDITION_LIST[@]}"; do
   CONDITION="$(echo "$CONDITION" | xargs)"
-  if [[ "$CONDITION" != "baseline_context" && "$CONDITION" != "no_context" ]]; then
+  if [[ "$CONDITION" != "baseline" && "$CONDITION" != "tuned" ]]; then
     echo "Invalid condition: $CONDITION"
     exit 6
   fi
@@ -105,7 +111,13 @@ for CONDITION in "${CONDITION_LIST[@]}"; do
   COND_RUN_ID="${RUN_ID_BASE}__${CONDITION}"
   PREDS_PATH="artifacts/preds/${RUN_ID_BASE}/${CONDITION}/preds.jsonl"
 
-  echo "[3/4][$CONDITION] Inference"
+  if [[ "$CONDITION" == "baseline" ]]; then
+    CONTEXTS_ROOT="$BASELINE_CTX_ROOT"
+  else
+    CONTEXTS_ROOT="$TUNED_CTX_ROOT"
+  fi
+
+  echo "[2/3][$CONDITION] Inference"
   python scripts/run_inference.py \
     --dataset_name "$DATASET_NAME" \
     --split "$SPLIT" \
@@ -115,10 +127,11 @@ for CONDITION in "${CONDITION_LIST[@]}"; do
     --runner "$RUNNER" \
     --timeout_s "$TIMEOUT_S" \
     --step_limit "$STEP_LIMIT" \
+    --contexts_root "$CONTEXTS_ROOT" \
     --run_id "$COND_RUN_ID" \
     --out "$PREDS_PATH"
 
-  echo "[4/4][$CONDITION] Evaluation"
+  echo "[3/3][$CONDITION] Evaluation"
   bash scripts/run_swebench_eval.sh \
     "$DATASET_NAME" \
     "$PREDS_PATH" \
@@ -130,4 +143,4 @@ echo
 echo "Done."
 echo "Run base: $RUN_ID_BASE"
 echo "Predictions root: artifacts/preds/$RUN_ID_BASE"
-echo "Results roots: results/${RUN_ID_BASE}__baseline_context and/or results/${RUN_ID_BASE}__no_context"
+echo "Results roots: results/${RUN_ID_BASE}__baseline and/or results/${RUN_ID_BASE}__tuned"

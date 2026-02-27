@@ -51,7 +51,25 @@ bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2
 Use both conditions in one command:
 
 ```bash
-bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline_context,no_context
+bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline,tuned
 ```
 
 Default IDs file: `scripts/easy_4_ids.txt`.
+
+## Adaptive SWE-Smith Context Loop (v1)
+
+Normalize SWE-Smith tasks into local contract:
+
+```bash
+python scripts/import_swesmith_tasks.py --source /path/to/swesmith_tasks.jsonl --out artifacts/tasks/swesmith_norm.jsonl
+```
+
+Run adaptive rounds (generate/eval/update policy each round):
+
+```bash
+python scripts/run_adaptive_context_loop.py \
+	--model openai/gpt-5.2 \
+	--tasks_file artifacts/tasks/swesmith_norm.jsonl \
+	--rounds 2 \
+	--conditions baseline,tuned
+```

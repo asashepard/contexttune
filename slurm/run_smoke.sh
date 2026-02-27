@@ -25,25 +25,21 @@ cd "$REPO_ROOT"
 source ~/.bashrc || true
 conda activate "$ENV_NAME"
 
-python scripts/build_signals.py \
-  --dataset_name "$DATASET_NAME" \
-  --split "$SPLIT" \
-  --instance_ids_file scripts/smoke_3_ids.txt
-
 python scripts/build_context.py \
   --dataset_name "$DATASET_NAME" \
   --split "$SPLIT" \
-  --instance_ids_file scripts/smoke_3_ids.txt
+  --instance_ids_file scripts/smoke_3_ids.txt \
+  --mode baseline
 
-RUN_ID="${RUN_TAG}__baseline_context"
-PREDS_PATH="artifacts/preds/${RUN_TAG}/baseline_context/preds.jsonl"
+RUN_ID="${RUN_TAG}__baseline"
+PREDS_PATH="artifacts/preds/${RUN_TAG}/baseline/preds.jsonl"
 
 python scripts/run_inference.py \
   --dataset_name "$DATASET_NAME" \
   --split "$SPLIT" \
   --instance_ids_file scripts/smoke_3_ids.txt \
   --model "$MODEL_NAME" \
-  --ablation baseline_context \
+  --ablation baseline \
   --runner "$RUNNER" \
   --timeout_s "$TIMEOUT_S" \
   --step_limit "$STEP_LIMIT" \

@@ -49,7 +49,7 @@ echo -e "condition\tinfer_job_id\teval_job_id\tarray\tshard_dir" > "$JOB_MANIFES
 echo "Submitting full-verified arrays"
 echo "run_id=$RUN_ID shards=$SHARD_COUNT array=$ARRAY_SPEC"
 
-for CONDITION in no_context baseline_context; do
+for CONDITION in baseline tuned; do
   INFER_JOB_ID="$(sbatch --parsable \
     --array "$ARRAY_SPEC" \
     --partition "$INFER_PARTITION" \

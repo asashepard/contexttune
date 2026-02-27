@@ -14,7 +14,7 @@ REPO_ROOT="${REPO_ROOT:-$PWD}"
 ENV_NAME="${ENV_NAME:-contexttune-py311}"
 MODEL_NAME="${MODEL_NAME:?set MODEL_NAME, e.g. openai/<model>}"
 RUN_ID="${RUN_ID:?set RUN_ID, e.g. verified_full_gpmoo_001}"
-CONDITION="${CONDITION:?set CONDITION=no_context|baseline_context}"
+CONDITION="${CONDITION:?set CONDITION=baseline|tuned}"
 SHARD_DIR="${SHARD_DIR:?set SHARD_DIR, e.g. artifacts/shards/full_verified}"
 DATASET_NAME="${DATASET_NAME:-princeton-nlp/SWE-bench_Verified}"
 SPLIT="${SPLIT:-test}"
@@ -22,7 +22,7 @@ RUNNER="${RUNNER:-mini_swe_agent_swebench}"
 TIMEOUT_S="${TIMEOUT_S:-600}"
 STEP_LIMIT="${STEP_LIMIT:-30}"
 
-if [[ "$CONDITION" != "no_context" && "$CONDITION" != "baseline_context" ]]; then
+if [[ "$CONDITION" != "baseline" && "$CONDITION" != "tuned" ]]; then
   echo "Invalid CONDITION: $CONDITION"
   exit 2
 fi
@@ -55,15 +55,11 @@ PREDS_PATH="artifacts/preds/${RUN_ID}/${CONDITION}/${SHARD_NAME}.jsonl"
 
 echo "task_id=$TASK_ID shard=$INSTANCE_IDS_FILE condition=$CONDITION"
 
-python scripts/build_signals.py \
-  --dataset_name "$DATASET_NAME" \
-  --split "$SPLIT" \
-  --instance_ids_file "$INSTANCE_IDS_FILE"
-
 python scripts/build_context.py \
   --dataset_name "$DATASET_NAME" \
   --split "$SPLIT" \
-  --instance_ids_file "$INSTANCE_IDS_FILE"
+  --instance_ids_file "$INSTANCE_IDS_FILE" \
+  --mode "$CONDITION"
 
 python scripts/run_inference.py \
   --dataset_name "$DATASET_NAME" \

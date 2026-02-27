@@ -14,9 +14,6 @@
 ```
 artifacts/preds/<run_id>/preds.jsonl   # Prediction files
 artifacts/logs/<run_id>/<instance_id>.log  # Per-instance debug logs
-artifacts/repos_cache/<repo_dirname>.git   # Bare git mirrors
-artifacts/worktrees/<repo_dirname>/<commit>/  # Git worktrees (checked out repos)
-artifacts/signals/<repo_dirname>/<commit>/signals.json  # Repo signals (Step 4)
 artifacts/contexts/<repo_dirname>/<commit>/context.json  # Structured context
 artifacts/contexts/<repo_dirname>/<commit>/context.md    # Rendered context (Step 5)
 results/<run_id>/                       # Evaluation outputs
@@ -30,18 +27,6 @@ results/<run_id>/                       # Evaluation outputs
 **repo_dirname**: Always `repo.replace("/", "__")` (e.g., `astropy/astropy` → `astropy__astropy`).
 
 ### Cleanup
-
-To reset git cache and worktrees:
-```bash
-rm -rf artifacts/repos_cache artifacts/worktrees
-```
-
-Worktrees are not auto-pruned. Delete manually when disk space is needed.
-
-To reset signals:
-```bash
-rm -rf artifacts/signals
-```
 
 Direct hard trim (retains summary snapshots only):
 ```bash
@@ -63,7 +48,7 @@ PowerShell wrapper:
 
 - **Sorted lists**: All list outputs are sorted alphabetically.
 - **Normalized paths**: Use `/` separator, relative to repo root.
-- **No timestamps**: `signals.json` and `context.md` exclude timestamps for byte-identical reruns.
+- **No timestamps**: `context.md` excludes timestamps for byte-identical reruns.
 - **No randomness**: No random suffixes or UUIDs in deterministic outputs.
 - **Repo dirname**: Always use `repo.replace("/", "__")` for filesystem paths (e.g., `astropy/astropy` → `astropy__astropy`).
 
@@ -74,13 +59,14 @@ PowerShell wrapper:
 - **Per-card budget**: 900 chars max.
 - **No tokenizer dependency**: Simpler, deterministic.
 
-### Context Cards (Fixed Order)
+### Context Cards (Policy-Driven)
 
-1. `repo_identity` — Repository metadata, primary packages
-2. `tests_howto` — Test commands, directories
-3. `editing_norms` — Global editing guidelines (constant)
-4. `routing_guidance` — Hot paths, module prefixes, entrypoints
-5. `pitfalls` — Warnings about layout quirks
+Baseline/tuned policies currently use task-centric cards:
+
+1. `issue_focus` — Condensed problem statement focus
+2. `fix_plan` — Minimal-change implementation guidance
+3. `validation` — Testing/verification checklist
+4. `editing_norms` — Global editing guidelines
 
 ## Run ID Format
 
@@ -133,11 +119,10 @@ Minimal, pinned in `requirements.txt`:
 
 - [x] Harness sanity check + dummy prediction writer
 - [x] Minimal single-shot inference runner (Step 3)
-- [x] Repo signals extraction (Step 4)
-- [x] Baseline context generation (Step 5)
+- [x] Baseline/tuned context generation (task metadata + policy)
 - [x] Pipeline orchestration (Step 6)
 
-## Step 6: Verified Mini Baseline Experiment
+## Step 6: Verified Mini Experiment (Baseline vs Tuned)
 
 ### Usage
 
@@ -153,10 +138,10 @@ python scripts/run_verified_mini_baseline.py --model my-model --max_workers_eval
 ### Output Layout
 
 ```
-artifacts/preds/<group_id>/no_context/preds.jsonl
-artifacts/preds/<group_id>/baseline_context/preds.jsonl
-results/<group_id>__no_context/           # harness outputs
-results/<group_id>__baseline_context/     # harness outputs
+artifacts/preds/<group_id>/baseline/preds.jsonl
+artifacts/preds/<group_id>/tuned/preds.jsonl
+results/<group_id>__baseline/             # harness outputs
+results/<group_id>__tuned/                # harness outputs
 results/<group_id>/
   ├── logs/                               # pipeline step logs
   ├── summary.json                        # comparison summary
@@ -172,8 +157,8 @@ results/<group_id>/
   "model": "local/placeholder",
   "instance_count": 50,
   "conditions": {
-    "no_context": {"resolved": 0, "total": 50, "rate": 0.0, ...},
-    "baseline_context": {"resolved": 0, "total": 50, "rate": 0.0, ...}
+    "baseline": {"resolved": 0, "total": 50, "rate": 0.0, ...},
+    "tuned": {"resolved": 0, "total": 50, "rate": 0.0, ...}
   },
   "delta": {"resolved": 0, "rate": 0.0}
 }
@@ -182,7 +167,7 @@ results/<group_id>/
 ### Prerequisites
 
 - Docker must be running for harness evaluation
-- Signals and contexts are built automatically (cached unless --force)
+- Contexts are built automatically (cached unless --force)
 
 ## Runner Backends
 
@@ -203,7 +188,7 @@ For achieving a non-zero baseline on SWE-bench Verified Mini, use `mini_swe_agen
 python scripts/run_inference.py \
     --model openai/gpt-4 \
     --runner mini_swe_agent_swebench \
-    --ablation baseline_context \
+  --ablation baseline \
     --limit 50
 ```
 
@@ -234,6 +219,15 @@ When context is injected, it uses these delimiters (identical across all runners
 ```
 
 This ensures the experimental variable is the **context artifact**, not the runner wiring.
+
+## Adaptive Loop (SWE-Smith v1)
+
+- `scripts/import_swesmith_tasks.py` converts SWE-Smith outputs to normalized task JSONL.
+- `scripts/run_adaptive_context_loop.py` runs multi-round adaptive experiments:
+  - build baseline/tuned contexts
+  - run conditions (`baseline`, `tuned`)
+  - evaluate
+  - update policy via OpenAI-compatible LLM call
 
 ### Invariant
 

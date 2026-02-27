@@ -1,51 +1,29 @@
 #!/usr/bin/env python3
-"""Build baseline context for SWE-bench instances from signals."""
+"""Build context artifacts for SWE-bench instances without repo signal walking."""
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from context_policy.context_gen.baseline import build_baseline_context, write_context
+from context_policy.context_gen.baseline import (
+    build_task_context_with_policy,
+    write_context,
+)
 from context_policy.datasets.swebench import load_instances, read_instance_ids
+from context_policy.policy.state import default_policy, load_policy
 from context_policy.utils.paths import (
     CONTEXTS_DIR,
-    PROJECT_ROOT,
-    SIGNALS_DIR,
-    get_context_path,
-    get_signals_path,
     repo_to_dirname,
 )
 
 
-def load_signals(signals_path: Path) -> dict:
-    """Load signals from JSON file.
-
-    Args:
-        signals_path: Path to signals.json.
-
-    Returns:
-        Signals dict.
-
-    Raises:
-        FileNotFoundError: If signals.json doesn't exist.
-    """
-    if not signals_path.exists():
-        raise FileNotFoundError(
-            f"Signals file not found: {signals_path}\n"
-            f"Run 'python scripts/build_signals.py' first to generate signals."
-        )
-    with signals_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build baseline context for SWE-bench instances."
+        description="Build baseline/tuned context artifacts for SWE-bench instances."
     )
     parser.add_argument(
         "--dataset_name",
@@ -63,15 +41,15 @@ def main() -> None:
         help="Path to file with instance IDs (one per line).",
     )
     parser.add_argument(
+        "--tasks_file",
+        default=None,
+        help="Path to normalized task JSON/JSONL file (overrides dataset loading).",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
         help="Maximum number of instances to process.",
-    )
-    parser.add_argument(
-        "--signals_root",
-        default=str(SIGNALS_DIR),
-        help="Root directory for signals files.",
     )
     parser.add_argument(
         "--contexts_root",
@@ -83,10 +61,37 @@ def main() -> None:
         action="store_true",
         help="Overwrite existing context files.",
     )
+    parser.add_argument(
+        "--policy_file",
+        default=None,
+        help="Optional policy JSON file for policy-driven context generation.",
+    )
+    parser.add_argument(
+        "--mode",
+        default="baseline",
+        choices=["baseline", "tuned"],
+        help="Context mode: baseline uses default policy, tuned uses --policy_file if provided.",
+    )
+    parser.add_argument(
+        "--round_id",
+        default=None,
+        help="Optional adaptive round ID metadata field.",
+    )
+    parser.add_argument(
+        "--source_task_batch",
+        default=None,
+        help="Optional task batch source metadata field.",
+    )
 
     args = parser.parse_args()
-    signals_root = Path(args.signals_root)
     contexts_root = Path(args.contexts_root)
+    if args.mode == "baseline":
+        policy = default_policy()
+        policy["policy_version"] = "baseline"
+    else:
+        policy = load_policy(args.policy_file) if args.policy_file else default_policy()
+        if not policy.get("policy_version"):
+            policy["policy_version"] = "tuned"
 
     # Load instance IDs if provided
     instance_ids = None
@@ -101,6 +106,7 @@ def main() -> None:
         split=args.split,
         instance_ids=instance_ids,
         limit=args.limit,
+        tasks_file=args.tasks_file,
     )
     print(f"Loaded {len(instances)} instances")
     print()
@@ -128,12 +134,13 @@ def main() -> None:
         print(f"[{i+1}/{len(instances)}] {instance_id} - processing...")
 
         try:
-            # Load signals
-            signals_path = signals_root / repo_dirname / commit / "signals.json"
-            signals = load_signals(signals_path)
-
-            # Build context
-            context = build_baseline_context(signals, repo, commit)
+            # Build context directly from task metadata + policy
+            context = build_task_context_with_policy(
+                instance,
+                policy=policy,
+                round_id=args.round_id,
+                source_task_batch=args.source_task_batch,
+            )
 
             # Write outputs
             write_context(context, json_path, md_path)
@@ -143,9 +150,6 @@ def main() -> None:
             print(f"  -> wrote context.md ({total_chars} chars, {len(context['cards'])} cards)")
             success_count += 1
 
-        except FileNotFoundError as e:
-            print(f"  -> ERROR: {e}", file=sys.stderr)
-            error_count += 1
         except Exception as e:
             print(f"  -> ERROR: {e}", file=sys.stderr)
             error_count += 1

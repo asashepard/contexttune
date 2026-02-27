@@ -5,9 +5,19 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from context_policy.policy.state import default_policy
+
 # Character budgets (approx tokens = chars // 4)
 TOTAL_CHAR_BUDGET = 3200  # ~800 tokens
 CARD_CHAR_BUDGET = 900    # max per card
+
+DEFAULT_CARD_ORDER = [
+    "repo_identity",
+    "tests_howto",
+    "editing_norms",
+    "routing_guidance",
+    "pitfalls",
+]
 
 
 def truncate(text: str, max_chars: int) -> str:
@@ -221,33 +231,183 @@ def build_baseline_context(signals: dict, repo: str, commit: str) -> dict:
     Returns:
         Context dict conforming to schema/context_schema.json.
     """
-    # Fixed order for determinism
-    cards = [
-        _build_repo_identity_card(signals),
-        _build_tests_howto_card(signals),
-        _build_editing_norms_card(),
-        _build_routing_guidance_card(signals),
-        _build_pitfalls_card(signals),
-    ]
+    return build_context_with_policy(signals, repo, commit, policy=default_policy())
 
-    # Enforce total budget by truncating routing_guidance if needed
-    total_chars = sum(len(c["body"]) for c in cards)
-    if total_chars > TOTAL_CHAR_BUDGET:
-        excess = total_chars - TOTAL_CHAR_BUDGET
-        # Find routing_guidance and truncate it further
-        for card in cards:
-            if card["id"] == "routing_guidance":
+
+def build_context_with_policy(
+    signals: dict,
+    repo: str,
+    commit: str,
+    *,
+    policy: dict,
+    round_id: str | None = None,
+    source_task_batch: str | None = None,
+) -> dict:
+    """Build context using a policy describing card order and per-card budgets."""
+    builders = {
+        "repo_identity": lambda: _build_repo_identity_card(signals),
+        "tests_howto": lambda: _build_tests_howto_card(signals),
+        "editing_norms": _build_editing_norms_card,
+        "routing_guidance": lambda: _build_routing_guidance_card(signals),
+        "pitfalls": lambda: _build_pitfalls_card(signals),
+    }
+
+    policy_cards = policy.get("cards", {})
+    card_order = policy.get("card_order") or list(DEFAULT_CARD_ORDER)
+    total_budget = int(policy.get("total_char_budget", TOTAL_CHAR_BUDGET))
+
+    cards: list[dict] = []
+    for card_id in card_order:
+        if card_id not in builders:
+            continue
+        cfg = policy_cards.get(card_id, {})
+        if cfg.get("enabled", True) is False:
+            continue
+        card = builders[card_id]()
+        max_chars = int(cfg.get("max_chars", CARD_CHAR_BUDGET))
+        card["body"] = truncate(card["body"], max_chars)
+        cards.append(card)
+
+    total_chars = sum(len(card["body"]) for card in cards)
+    if total_chars > total_budget and cards:
+        overflow = total_chars - total_budget
+        # Deterministic trimming: highest card count/priority to trim last in list first.
+        while overflow > 0:
+            trimmed_any = False
+            for card in reversed(cards):
                 current_len = len(card["body"])
-                new_len = max(50, current_len - excess)
-                card["body"] = truncate(card["body"], new_len)
+                if current_len <= 80:
+                    continue
+                reduce_by = min(overflow, max(1, current_len // 8))
+                card["body"] = truncate(card["body"], current_len - reduce_by)
+                overflow -= reduce_by
+                trimmed_any = True
+                if overflow <= 0:
+                    break
+            if not trimmed_any:
                 break
 
-    return {
+    context = {
         "repo": repo,
         "commit": commit,
-        "char_budget_total": TOTAL_CHAR_BUDGET,
+        "char_budget_total": total_budget,
         "cards": cards,
     }
+    if policy.get("policy_version"):
+        context["policy_version"] = policy["policy_version"]
+    if round_id:
+        context["round_id"] = round_id
+    if source_task_batch:
+        context["source_task_batch"] = source_task_batch
+    return context
+
+
+def _build_issue_focus_card(instance: dict) -> dict:
+    problem = instance.get("problem_statement", "")
+    if not problem:
+        body = "- No issue statement provided."
+    else:
+        lines = [line.strip() for line in problem.splitlines() if line.strip()]
+        snippet = "\n".join(lines[:12])
+        body = f"- Focus issue:\n{snippet}"
+    return {
+        "id": "issue_focus",
+        "title": "Issue Focus",
+        "body": truncate(body, CARD_CHAR_BUDGET),
+        "evidence": ["task:problem_statement"],
+        "confidence": 0.9,
+    }
+
+
+def _build_fix_plan_card(instance: dict) -> dict:
+    repo = instance.get("repo", "unknown")
+    body = (
+        f"- Target repository: {repo}\n"
+        "- Implement the smallest behavior-correct fix.\n"
+        "- Preserve public API unless issue explicitly requires API change.\n"
+        "- Keep patch narrowly scoped to issue symptoms and tests."
+    )
+    return {
+        "id": "fix_plan",
+        "title": "Fix Plan",
+        "body": truncate(body, CARD_CHAR_BUDGET),
+        "evidence": ["task:repo", "global_constant"],
+        "confidence": 0.8,
+    }
+
+
+def _build_validation_card() -> dict:
+    body = (
+        "- Run relevant tests first, then nearby module tests.\n"
+        "- Ensure patch applies cleanly and avoids unrelated edits.\n"
+        "- Prefer deterministic changes and explicit edge-case handling."
+    )
+    return {
+        "id": "validation",
+        "title": "Validation",
+        "body": truncate(body, CARD_CHAR_BUDGET),
+        "evidence": ["global_constant"],
+        "confidence": 0.8,
+    }
+
+
+def build_task_context_with_policy(
+    instance: dict,
+    *,
+    policy: dict,
+    round_id: str | None = None,
+    source_task_batch: str | None = None,
+) -> dict:
+    """Build context directly from task metadata (no repo signal walking)."""
+    builders = {
+        "issue_focus": lambda: _build_issue_focus_card(instance),
+        "fix_plan": lambda: _build_fix_plan_card(instance),
+        "validation": _build_validation_card,
+        "editing_norms": _build_editing_norms_card,
+    }
+
+    policy_cards = policy.get("cards", {})
+    card_order = policy.get("card_order") or ["issue_focus", "fix_plan", "validation", "editing_norms"]
+    total_budget = int(policy.get("total_char_budget", TOTAL_CHAR_BUDGET))
+
+    cards: list[dict] = []
+    for card_id in card_order:
+        if card_id not in builders:
+            continue
+        cfg = policy_cards.get(card_id, {})
+        if cfg.get("enabled", True) is False:
+            continue
+        card = builders[card_id]()
+        max_chars = int(cfg.get("max_chars", CARD_CHAR_BUDGET))
+        card["body"] = truncate(card["body"], max_chars)
+        cards.append(card)
+
+    total_chars = sum(len(card["body"]) for card in cards)
+    if total_chars > total_budget and cards:
+        overflow = total_chars - total_budget
+        for card in reversed(cards):
+            if overflow <= 0:
+                break
+            current_len = len(card["body"])
+            if current_len <= 80:
+                continue
+            reduce_by = min(overflow, max(1, current_len // 6))
+            card["body"] = truncate(card["body"], current_len - reduce_by)
+            overflow -= reduce_by
+
+    context = {
+        "repo": instance.get("repo", "unknown"),
+        "commit": instance.get("base_commit", "unknown"),
+        "char_budget_total": total_budget,
+        "cards": cards,
+    }
+    if policy.get("policy_version"):
+        context["policy_version"] = policy["policy_version"]
+    if round_id:
+        context["round_id"] = round_id
+    if source_task_batch:
+        context["source_task_batch"] = source_task_batch
+    return context
 
 
 def render_markdown(context: dict) -> str:

@@ -35,6 +35,11 @@ def main() -> None:
         help="Path to file with instance IDs (one per line).",
     )
     parser.add_argument(
+        "--tasks_file",
+        default=None,
+        help="Path to normalized task JSON/JSONL file (overrides dataset loading).",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -61,6 +66,7 @@ def main() -> None:
         split=args.split,
         instance_ids=instance_ids,
         limit=args.limit,
+        tasks_file=args.tasks_file,
     )
     print(f"Loaded {len(instances)} instances")
     print()

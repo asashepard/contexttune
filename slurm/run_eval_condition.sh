@@ -12,11 +12,11 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-$PWD}"
 ENV_NAME="${ENV_NAME:-contexttune-py311}"
 RUN_ID="${RUN_ID:?set RUN_ID, e.g. verified_mini_gpmoo_001}"
-CONDITION="${CONDITION:?set CONDITION=no_context|baseline_context}"
+CONDITION="${CONDITION:?set CONDITION=baseline|tuned}"
 DATASET_NAME="${DATASET_NAME:-princeton-nlp/SWE-bench_Verified}"
 MAX_WORKERS_EVAL="${MAX_WORKERS_EVAL:-1}"
 
-if [[ "$CONDITION" != "no_context" && "$CONDITION" != "baseline_context" ]]; then
+if [[ "$CONDITION" != "baseline" && "$CONDITION" != "tuned" ]]; then
   echo "Invalid CONDITION: $CONDITION"
   exit 2
 fi

@@ -85,6 +85,11 @@ def main() -> None:
         help="Path to file with instance IDs (one per line).",
     )
     parser.add_argument(
+        "--tasks_file",
+        default=None,
+        help="Path to normalized task JSON/JSONL file (overrides dataset loading).",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -107,14 +112,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--ablation",
-        choices=["no_context", "baseline_context"],
-        default="no_context",
-        help="Ablation mode (default: no_context).",
+        choices=["baseline", "tuned"],
+        default="baseline",
+        help="Run mode: baseline or tuned.",
     )
     parser.add_argument(
         "--contexts_root",
         default="artifacts/contexts",
-        help="Root directory for context files (used with baseline_context).",
+        help="Root directory for context files (used with baseline/tuned modes).",
     )
     parser.add_argument(
         "--max_tokens",
@@ -200,6 +205,7 @@ def main() -> None:
         split=args.split,
         instance_ids=instance_ids,
         limit=args.limit,
+        tasks_file=args.tasks_file,
     )
     print(f"Loaded {len(instances)} instances")
 
@@ -208,7 +214,7 @@ def main() -> None:
     if completed_ids:
         print(f"Resuming: {len(completed_ids)} already completed")
 
-    # Context root for baseline_context ablation
+    # Context root for baseline/tuned modes
     contexts_root = Path(args.contexts_root)
 
     # Process each instance
@@ -224,12 +230,11 @@ def main() -> None:
 
         # Determine context
         context_md: str | None = None
-        if args.ablation == "baseline_context":
-            context_md = load_context(contexts_root, instance["repo"], instance["base_commit"])
-            if context_md:
-                print(f"  Loaded context: {len(context_md)} chars")
-            else:
-                context_md = None  # Empty string -> None
+        context_md = load_context(contexts_root, instance["repo"], instance["base_commit"])
+        if context_md:
+            print(f"  Loaded context: {len(context_md)} chars")
+        else:
+            context_md = None
 
         try:
             # Generate patch (or placeholder in dry-run mode)

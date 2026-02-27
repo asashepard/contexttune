@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Run Verified Mini baseline experiment: compare no_context vs baseline_context.
+"""Run Verified Mini experiment: compare baseline vs tuned modes.
 
 Usage:
     python scripts/run_verified_mini_baseline.py --model local/placeholder --dry_run
     python scripts/run_verified_mini_baseline.py --model openai/gpt-4 --max_workers_eval 4
 
 This script orchestrates:
-1. Build signals for all instances (once)
-2. Build context from signals (once)
-3. Run inference for each ablation condition
-4. Run SWE-bench harness evaluation for each condition
-5. Summarize and compare results
+1. Build baseline and tuned contexts from task metadata
+2. Run inference for each mode
+3. Run SWE-bench harness evaluation for each mode
+4. Summarize and compare results
 
 Requires Docker to be running for harness evaluation.
 """
@@ -30,7 +29,7 @@ from context_policy.utils.paths import PREDS_DIR, RESULTS_DIR
 from context_policy.utils.run_id import make_run_id
 from context_policy.utils.subproc import run as subproc_run
 
-DEFAULT_CONDITIONS = ["no_context", "baseline_context"]
+DEFAULT_CONDITIONS = ["baseline", "tuned"]
 
 # Runner-specific default timeouts (seconds)
 _RUNNER_DEFAULT_TIMEOUT: dict[str, int] = {
@@ -147,9 +146,14 @@ def main() -> None:
         "--conditions",
         default=None,
         help=(
-            "Comma-separated conditions to run (default: no_context,baseline_context). "
-            "Example: --conditions baseline_context"
+            "Comma-separated conditions to run (default: baseline,tuned). "
+            "Example: --conditions tuned"
         ),
+    )
+    parser.add_argument(
+        "--tuned_policy_file",
+        default=None,
+        help="Optional policy file used to build tuned contexts.",
     )
     parser.add_argument(
         "--timeout_s",
@@ -173,7 +177,7 @@ def main() -> None:
     if args.conditions:
         conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
         for c in conditions:
-            if c not in ("no_context", "baseline_context"):
+            if c not in ("baseline", "tuned"):
                 parser.error(f"Unknown condition: {c}")
     else:
         conditions = list(DEFAULT_CONDITIONS)
@@ -210,15 +214,18 @@ def main() -> None:
         instance_args = ["--limit", str(args.limit)]
 
     # =========================================================================
-    # Step 1: Build signals (prerequisite for baseline_context)
+    # Step 1: Build baseline context
     # =========================================================================
     force_arg = ["--force"] if args.force else []
+    baseline_contexts_root = PREDS_DIR.parent / "contexts" / group_id / "baseline"
     run_step(
-        "build_signals",
+        "build_context_baseline",
         [
-            sys.executable, "scripts/build_signals.py",
+            sys.executable, "scripts/build_context.py",
             "--dataset_name", args.dataset_name,
             "--split", args.split,
+            "--mode", "baseline",
+            "--contexts_root", str(baseline_contexts_root),
             *instance_args,
             *force_arg,
         ],
@@ -226,14 +233,19 @@ def main() -> None:
     )
 
     # =========================================================================
-    # Step 2: Build context from signals
+    # Step 2: Build tuned context
     # =========================================================================
+    tuned_contexts_root = PREDS_DIR.parent / "contexts" / group_id / "tuned"
+    tuned_policy_args = ["--policy_file", args.tuned_policy_file] if args.tuned_policy_file else []
     run_step(
-        "build_context",
+        "build_context_tuned",
         [
             sys.executable, "scripts/build_context.py",
             "--dataset_name", args.dataset_name,
             "--split", args.split,
+            "--mode", "tuned",
+            "--contexts_root", str(tuned_contexts_root),
+            *tuned_policy_args,
             *instance_args,
             *force_arg,
         ],
@@ -275,6 +287,7 @@ def main() -> None:
                     "--runner", args.runner,
                     "--timeout_s", str(timeout_s),
                     "--step_limit", str(args.step_limit),
+                    "--contexts_root", str(baseline_contexts_root if condition == "baseline" else tuned_contexts_root),
                     "--run_id", run_id,
                     "--out", str(preds_path),
                     *dry_run_arg,
@@ -334,10 +347,10 @@ def main() -> None:
 
     # Compute delta only when both conditions are present
     delta_info: dict | None = None
-    if "no_context" in condition_results and "baseline_context" in condition_results:
-        no_ctx = condition_results["no_context"]
-        base_ctx = condition_results["baseline_context"]
-        delta = base_ctx["resolved"] - no_ctx["resolved"]
+    if "baseline" in condition_results and "tuned" in condition_results:
+        baseline = condition_results["baseline"]
+        tuned = condition_results["tuned"]
+        delta = tuned["resolved"] - baseline["resolved"]
         delta_rate = delta / total if total else 0.0
         delta_info = {"resolved": delta, "rate": delta_rate}
         print(f"  {'delta':20s} {delta:+3}/{total} ({delta_rate*100:+5.1f}%)")

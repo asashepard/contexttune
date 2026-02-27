@@ -14,7 +14,7 @@ REPO_ROOT="${REPO_ROOT:-$PWD}"
 ENV_NAME="${ENV_NAME:-contexttune-py311}"
 MODEL_NAME="${MODEL_NAME:?set MODEL_NAME, e.g. openai/<model>}"
 RUN_ID="${RUN_ID:?set RUN_ID, e.g. verified_mini_gpmoo_001}"
-CONDITION="${CONDITION:?set CONDITION=no_context|baseline_context}"
+CONDITION="${CONDITION:?set CONDITION=baseline|tuned}"
 DATASET_NAME="${DATASET_NAME:-princeton-nlp/SWE-bench_Verified}"
 SPLIT="${SPLIT:-test}"
 INSTANCE_IDS_FILE="${INSTANCE_IDS_FILE:-scripts/verified_mini_ids.txt}"
@@ -22,7 +22,7 @@ RUNNER="${RUNNER:-mini_swe_agent_swebench}"
 TIMEOUT_S="${TIMEOUT_S:-600}"
 STEP_LIMIT="${STEP_LIMIT:-30}"
 
-if [[ "$CONDITION" != "no_context" && "$CONDITION" != "baseline_context" ]]; then
+if [[ "$CONDITION" != "baseline" && "$CONDITION" != "tuned" ]]; then
   echo "Invalid CONDITION: $CONDITION"
   exit 2
 fi
@@ -31,15 +31,11 @@ cd "$REPO_ROOT"
 source ~/.bashrc || true
 conda activate "$ENV_NAME"
 
-python scripts/build_signals.py \
-  --dataset_name "$DATASET_NAME" \
-  --split "$SPLIT" \
-  --instance_ids_file "$INSTANCE_IDS_FILE"
-
 python scripts/build_context.py \
   --dataset_name "$DATASET_NAME" \
   --split "$SPLIT" \
-  --instance_ids_file "$INSTANCE_IDS_FILE"
+  --instance_ids_file "$INSTANCE_IDS_FILE" \
+  --mode "$CONDITION"
 
 COND_RUN_ID="${RUN_ID}__${CONDITION}"
 PREDS_PATH="artifacts/preds/${RUN_ID}/${CONDITION}/preds.jsonl"

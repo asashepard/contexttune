@@ -39,3 +39,19 @@ For cluster runs on GPMoo, use the runbook and Slurm templates:
 - Runbook: `docs/GPMOO_RUNBOOK.md`
 - Slurm scripts: `slurm/run_preflight.sh`, `slurm/run_smoke.sh`, `slurm/run_mini_condition.sh`, `slurm/run_eval_condition.sh`, `slurm/run_full_condition_array.sh`, `slurm/run_full_eval_array.sh`
 - Submission/sharding helpers: `scripts/split_instance_ids.py`, `scripts/submit_full_verified_array.sh`
+
+## One-Command 4-Instance Run + Eval
+
+Run a standardized 4-instance sanity pack on EC2 or gpmoo shell:
+
+```bash
+bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2
+```
+
+Use both conditions in one command:
+
+```bash
+bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline_context,no_context
+```
+
+Default IDs file: `scripts/easy_4_ids.txt`.

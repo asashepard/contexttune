@@ -105,6 +105,22 @@ sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="no_context",DATA
 sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="baseline_context",DATASET_NAME="princeton-nlp/SWE-bench_Verified" slurm/run_eval_condition.sh
 ```
 
+## 5.5 One-Command 4-Instance Sanity Run
+
+For a quick, reusable run+eval command (EC2 or gpmoo shell):
+
+```bash
+bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2
+```
+
+To run both conditions:
+
+```bash
+bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline_context,no_context
+```
+
+IDs are read from `scripts/easy_4_ids.txt` by default.
+
 ## 6) Output Paths
 
 - Predictions:

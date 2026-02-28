@@ -30,6 +30,20 @@ from context_policy.runner.patch_utils import (
 DEFAULT_MAX_STEPS = 30
 
 
+def _docker_image_exists(image_name: str) -> bool:
+    """Return True if Docker image exists locally."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _get_instance_docker_image(instance: dict) -> str:
     """Resolve Docker image name for SWE-bench instance.
 
@@ -435,6 +449,19 @@ def generate_patch_with_mini_swebench(
 
     # Resolve Docker image
     image_name = _get_instance_docker_image(instance)
+
+    # Preflight: fail fast on missing images with actionable guidance.
+    if not _docker_image_exists(image_name):
+        instance_id = instance.get("instance_id", "<unknown>")
+        print(
+            "  ERROR: SWE-bench Docker image not found locally: "
+            f"{image_name} (instance_id={instance_id})"
+        )
+        print(
+            "  Build required images first, e.g.:\n"
+            "    python scripts/build_docker_images.py --instance_ids_file <ids.txt>"
+        )
+        return ""
 
     # Build task with context
     task = build_task_with_context(problem_statement, context_md)

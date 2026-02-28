@@ -50,8 +50,18 @@ def chat_completion(
         "Authorization": f"Bearer {get_api_key()}",
     }
 
+    request_model = model
+    # OpenAI's native API expects bare model IDs (e.g. "gpt-5.2").
+    # In other parts of this project (mini-swe-agent/litellm) we may pass
+    # provider-prefixed names like "openai/gpt-5.2". Normalize here when
+    # targeting api.openai.com to avoid 400 Bad Request.
+    if "api.openai.com" in base_url and "/" in request_model:
+        provider, bare = request_model.split("/", 1)
+        if provider.strip().lower() == "openai" and bare.strip():
+            request_model = bare.strip()
+
     payload = {
-        "model": model,
+        "model": request_model,
         "messages": messages,
         "temperature": temperature,
         "top_p": top_p,
@@ -74,6 +84,12 @@ def chat_completion(
             return data["choices"][0]["message"]["content"]
         except requests.RequestException as e:
             last_error = e
+            # Include response body for 4xx debugging (invalid model, params, etc.).
+            if hasattr(e, "response") and e.response is not None:
+                status = getattr(e.response, "status_code", None)
+                if status and 400 <= status < 500:
+                    body = e.response.text[:1200]
+                    last_error = RuntimeError(f"HTTP {status}: {body}")
             if attempt < max_retries - 1:
                 # Exponential backoff; extra wait on rate-limit
                 wait = 2 ** attempt

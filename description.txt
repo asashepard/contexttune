@@ -1,46 +1,40 @@
-ContextTune — Executive Summary (current state)
+ContextTune — Executive Summary
 
 What this project does
-- Runs SWE-bench Verified experiments with a fixed, reproducible pipeline: signals -> context -> inference -> harness evaluation.
-- Keeps SWE-bench harness unchanged; all outputs are standard predictions JSONL + harness result files.
+- Tunes per-repo guidance text blocks via hill-climbing, then evaluates
+  on SWE-bench Verified under two conditions (no_context vs tuned_context).
+- Uses SWE-smith to generate training tasks for each repo.
+- Keeps SWE-bench harness unchanged; all outputs are standard predictions
+  JSONL + harness result files.
 
-Current state (implemented)
-- Deterministic repo checkout/cache: bare mirrors + worktrees per repo/commit.
-- Signal extraction: writes artifacts/signals/<repo>/<commit>/signals.json (tree, py index, import graph, test manifest, hot paths).
-- Baseline context generation: writes artifacts/contexts/<repo>/<commit>/context.{json,md} with fixed card order and char budgets.
-- Inference entrypoint: scripts/run_inference.py (resume-safe JSONL append, dry-run mode, no_context/baseline_context ablations).
-- Runner backends:
-  - single_shot: one OpenAI-compatible call, diff extraction.
-  - mini_swe_agent: mini-swe-agent CLI with our injected context block delimiters.
-  - mini_swe_agent_swebench: mini-swe-agent in SWE-bench Docker env for parity.
-- Experiment runner: scripts/run_verified_mini_baseline.py executes no_context vs baseline_context and writes results/<group_id>/summary.json.
+Architecture
+- One tunable text block per repo (RepoGuidance dataclass, ≤3200 chars).
+- Hill-climbing tuner: init G₀ from LLM + repo introspection, then
+  T iterations × K candidates, scored on N SWE-smith tasks.
+- Scoring runs the Docker mini-swe-agent-swebench runner.
+- Final evaluation on SWE-bench Verified (no_context vs tuned_context).
 
-Important considerations
-- Primary runtime is Linux/WSL2 with Docker; Windows native is mainly for development.
-- Determinism is intentional (sorted paths/lists, stable artifact layout, resumable runs).
-- Context injection format is fixed across runners:
-  ======BEGIN_REPO_CONTEXT=====
-  ...
-  ======END_REPO_CONTEXT=====
-- mini_swe_agent_swebench depends on mini-swe-agent internal API stability; keep mini-swe-agent pinned.
+Pipeline
+1. Generate SWE-smith tasks per repo (scripts/generate_swesmith_tasks.py).
+2. Tune guidance per repo (scripts/tune_single_repo.py or run_experiment.py).
+3. Evaluate on Verified (scripts/run_experiment.py Phase 2).
 
-Next steps (whole experiment, simplified)
-1) Lock environment/pins (Python + package versions) and run a 1-instance smoke test per runner.
-2) Run Verified Mini baseline end-to-end (50 ids): no_context vs baseline_context.
-3) Repeat runs (same config) to confirm stability; compare summary.json deltas.
-4) Move to larger slice only after mini baseline is stable and non-crashing.
+Key modules
+- context_policy/guidance/ — schema, init, propose, score, tuner, gating, repo_info.
+- context_policy/loop/orchestrator.py — experiment orchestrator (tuning + eval).
+- context_policy/runner/mini_swe_agent_swebench.py — Docker-native agent runner.
+- context_policy/prompting/prompt_builder.py — prompt construction with guidance injection.
 
-EC2 testing plan (what you will do)
-- Provision Ubuntu EC2 with Docker running and enough disk for images/caches.
-- Install deps: pip install -r requirements.txt and pip install mini-swe-agent~=1.17.
-- Export model env vars (OPENAI_BASE_URL, OPENAI_API_KEY).
-- Run dry plumbing first:
-  python scripts/run_verified_mini_baseline.py --model local/placeholder --dry_run
-- Then real run:
-  python scripts/run_verified_mini_baseline.py --model <served_model> --max_workers_eval 1
-- Review outputs: artifacts/preds/... and results/<group_id>/summary.json; inspect per-step logs on failure.
+Context injection format
+  # REPO GUIDANCE (AUTO-TUNED)
+  ...guidance lines...
+  # END REPO GUIDANCE
 
-Next-next steps (Slurm + local model)
-- After EC2 validation, move to Slurm for larger/batched sweeps: run one job per condition/seed slice, keep the same scripts and artifact layout, and aggregate summary.json files centrally.
-- Serve a local model endpoint on cluster nodes (OpenAI-compatible URL), point OPENAI_BASE_URL to that service, and keep run_inference.py unchanged so only model endpoint/runner selection changes.
-- Start with short smoke jobs, then scale workers/array size gradually while tracking GPU utilization, queue time, and failure logs for reproducibility.
+12 experiment repos
+  django, astropy, sympy, scikit-learn, matplotlib, flask,
+  sphinx, pylint, pytest, requests, xarray, seaborn.
+
+Runtime
+- Primary: Linux/WSL2 with Docker.
+- Model inference: OpenAI-compatible HTTP API (OPENAI_BASE_URL, OPENAI_API_KEY).
+- Runner: mini_swe_agent_swebench (Docker) for both tuning and final eval.

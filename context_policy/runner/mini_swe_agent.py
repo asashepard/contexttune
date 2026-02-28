@@ -13,9 +13,13 @@ from context_policy.runner.patch_utils import (
     extract_patch_from_trajectory,
 )
 
-# Context block delimiters - must be identical across all runners
-CONTEXT_BLOCK_START = "======BEGIN_REPO_CONTEXT====="
-CONTEXT_BLOCK_END = "======END_REPO_CONTEXT====="
+# Context block delimiters
+CONTEXT_BLOCK_START = "# REPO GUIDANCE (AUTO-TUNED)"
+CONTEXT_BLOCK_END = "# END REPO GUIDANCE"
+
+# Legacy aliases
+_LEGACY_START = "======BEGIN_REPO_CONTEXT====="
+_LEGACY_END = "======END_REPO_CONTEXT====="
 
 
 class DockerNotAvailableError(Exception):
@@ -54,14 +58,14 @@ def check_docker_available() -> None:
 
 
 def build_task_with_context(problem_statement: str, context_md: str | None) -> str:
-    """Build task string with optional context block prepended.
+    """Build task string with optional guidance/context block prepended.
 
     Args:
         problem_statement: Original issue/problem text.
-        context_md: Optional context to prepend.
+        context_md: Optional guidance text to prepend.
 
     Returns:
-        Task string with context block if provided.
+        Task string with guidance block if provided.
     """
     if not context_md:
         return problem_statement

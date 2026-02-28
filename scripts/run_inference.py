@@ -157,6 +157,12 @@ def main() -> None:
         default=30,
         help="Agent step limit for mini_swe_agent_swebench runner (default: 30; 0=unlimited).",
     )
+    parser.add_argument(
+        "--guidance_dir",
+        default=None,
+        help="Directory containing per-repo best_guidance.json files "
+             "(e.g. results/exp1/guidance). Overrides --contexts_root.",
+    )
 
     args = parser.parse_args()
 
@@ -218,6 +224,21 @@ def main() -> None:
     # Context root for baseline/tuned modes
     contexts_root = Path(args.contexts_root)
 
+    # Load per-repo guidance if --guidance_dir is provided
+    guidance_map: dict[str, str] = {}  # repo -> guidance text
+    if args.guidance_dir:
+        from context_policy.guidance.schema import RepoGuidance
+        gdir = Path(args.guidance_dir)
+        for subdir in gdir.iterdir():
+            if subdir.is_dir():
+                best = subdir / "best_guidance.json"
+                if best.exists():
+                    g = RepoGuidance.load(best)
+                    guidance_map[g.repo] = g.render()
+                    print(f"  Loaded guidance for {g.repo} ({len(guidance_map[g.repo])} chars)")
+        if guidance_map:
+            print(f"Loaded guidance for {len(guidance_map)} repos")
+
     # Process each instance
     for i, instance in enumerate(instances):
         instance_id = instance["instance_id"]
@@ -231,11 +252,15 @@ def main() -> None:
 
         # Determine context
         context_md: str | None = None
-        context_md = load_context(contexts_root, instance["repo"], instance["base_commit"], instance_id)
-        if context_md:
-            print(f"  Loaded context: {len(context_md)} chars")
+        if instance["repo"] in guidance_map:
+            context_md = guidance_map[instance["repo"]]
+            print(f"  Using tuned guidance: {len(context_md)} chars")
         else:
-            context_md = None
+            context_md = load_context(contexts_root, instance["repo"], instance["base_commit"], instance_id)
+            if context_md:
+                print(f"  Loaded context: {len(context_md)} chars")
+            else:
+                context_md = None
 
         try:
             # Generate patch (or placeholder in dry-run mode)

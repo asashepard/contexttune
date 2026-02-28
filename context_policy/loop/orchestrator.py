@@ -1,401 +1,301 @@
-"""Adaptive context tuning loop orchestrator."""
+"""Per-repo guidance tuning orchestrator.
+
+Replaces the old adaptive-loop orchestrator with a design that:
+1. Tunes guidance independently for each of the 12 repos using SWE-smith.
+2. Evaluates on SWE-bench Verified under two conditions:
+   - ``no_context``: agent sees only the issue + tree.
+   - ``tuned_context``: agent sees the issue + tree + tuned guidance.
+"""
 from __future__ import annotations
 
 import json
 import sys
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from context_policy.context_gen.baseline import (
-    generate_context,
-    generate_context_dry_run,
-    write_context,
-)
-from context_policy.datasets.swebench import load_instances
-from context_policy.datasets.swesmith_adapter import generate_swesmith_tasks, import_swesmith_tasks
-from context_policy.loop.contracts import LoopState, RoundState, read_loop_state, write_loop_state
-from context_policy.policy.state import default_policy, load_policy, write_policy
-from context_policy.policy.update import update_policy_with_llm
-from context_policy.report.summarize import (
-    compute_rate,
-    load_instance_records,
-    load_results,
-    summarize_failure_taxonomy,
-)
-from context_policy.runner.mini_swe_agent import generate_patch_with_mini
+from context_policy.datasets.swebench import load_instances, read_instance_ids
+from context_policy.guidance.schema import RepoGuidance
+from context_policy.guidance.tuner import TuningConfig, run_tuning_loop
 from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench
-from context_policy.runner.single_shot import generate_patch
 from context_policy.utils.jsonl import read_jsonl
-from context_policy.utils.paths import PREDS_DIR, PROJECT_ROOT, RESULTS_DIR, repo_to_dirname
+from context_policy.utils.paths import PREDS_DIR, PROJECT_ROOT, RESULTS_DIR
 from context_policy.utils.subproc import run as subproc_run
 
 
-def _run_step(name: str, cmd: list[str], logs_dir: Path, timeout_s: int = 1800) -> int:
-    """Run an external command (eval scripts only)."""
-    stdout_log = logs_dir / f"{name}.stdout.log"
-    stderr_log = logs_dir / f"{name}.stderr.log"
-    return subproc_run(cmd, cwd=PROJECT_ROOT, stdout_path=stdout_log, stderr_path=stderr_log, timeout_s=timeout_s)
+# ── data classes ───────────────────────────────────────────────
 
 
-def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+@dataclass
+class ExperimentConfig:
+    """Top-level experiment configuration."""
+
+    experiment_id: str
+    model: str
+    repos: list[dict]  # each: {"repo": str, "commit": str, "tasks_file": str}
+
+    # Tuning hyperparams
+    iterations: int = 10
+    candidates_per_iter: int = 6
+    tasks_per_score: int = 20
+    char_budget: int = 3200
+
+    # Runner settings
+    timeout_s: int = 600
+    step_limit: int = 30
+
+    # Eval settings
+    eval_dataset: str = "princeton-nlp/SWE-bench_Verified"
+    eval_split: str = "test"
+    eval_instance_ids_file: str | None = None
+    max_workers_eval: int = 4
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
-# ---------------------------------------------------------------------------
-# In-process context build
-# ---------------------------------------------------------------------------
+@dataclass
+class ExperimentState:
+    """Persistent experiment state for resume support."""
 
-def _build_contexts(
-    *,
-    instances: list[dict],
-    policy: dict,
-    model: str,
-    contexts_root: Path,
-    round_id: str | None = None,
-    source_task_batch: str | None = None,
-    timeout_s: int = 120,
-    dry_run: bool = False,
-) -> int:
-    """Build context artifacts for all instances in-process.
+    experiment_id: str
+    created_at: str = ""
+    tuning_completed: list[str] = field(default_factory=list)
+    eval_completed: list[str] = field(default_factory=list)  # "<repo>__<condition>"
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(asdict(self), indent=2) + "\n", encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: Path) -> ExperimentState:
+        d = json.loads(path.read_text(encoding="utf-8"))
+        return cls(**d)
+
+
+# ── run experiment ─────────────────────────────────────────────
+
+
+def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
+    """Run the full tuning + evaluation experiment.
+
+    Phase 1: For each repo, run the hill-climbing tuning loop.
+    Phase 2: Evaluate on SWE-bench Verified (no_context vs tuned_context).
+
+    Args:
+        config: Experiment configuration.
+        dry_run: If True, skip inference (produce empty patches).
 
     Returns:
-        Number of contexts successfully built.
+        Path to the experiment results directory.
     """
-    success = 0
-    for instance in instances:
-        instance_id = instance["instance_id"]
-        repo = instance["repo"]
-        commit = instance["base_commit"]
-        repo_dirname = repo_to_dirname(repo)
+    exp_root = RESULTS_DIR / config.experiment_id
+    exp_root.mkdir(parents=True, exist_ok=True)
+    state_path = exp_root / "experiment_state.json"
 
-        json_path = contexts_root / repo_dirname / commit / instance_id / "context.json"
-        md_path = contexts_root / repo_dirname / commit / instance_id / "context.md"
-
-        try:
-            if dry_run:
-                ctx = generate_context_dry_run(
-                    instance, policy=policy,
-                    round_id=round_id, source_task_batch=source_task_batch,
-                )
-            else:
-                ctx = generate_context(
-                    instance, policy=policy, model=model,
-                    round_id=round_id, source_task_batch=source_task_batch,
-                    timeout_s=timeout_s,
-                )
-            write_context(ctx, json_path, md_path)
-            success += 1
-        except Exception as exc:
-            print(f"  Context build error for {instance_id}: {exc}", file=sys.stderr)
-    return success
-
-
-# ---------------------------------------------------------------------------
-# In-process inference
-# ---------------------------------------------------------------------------
-
-def _load_context_md(contexts_root: Path, repo: str, commit: str, instance_id: str) -> str:
-    """Load context.md for an instance, return empty string if missing."""
-    md_path = contexts_root / repo_to_dirname(repo) / commit / instance_id / "context.md"
-    if md_path.exists():
-        return md_path.read_text(encoding="utf-8")
-    return ""
-
-
-def _run_inference(
-    *,
-    instances: list[dict],
-    model: str,
-    runner: str,
-    contexts_root: Path,
-    preds_path: Path,
-    logs_dir: Path,
-    timeout_s: int,
-    step_limit: int,
-    dry_run: bool = False,
-) -> None:
-    """Run inference for all instances in-process, appending to preds_path."""
-    # Resume support
-    completed_ids: set[str] = set()
-    if preds_path.exists():
-        completed_ids = {r["instance_id"] for r in read_jsonl(preds_path)}
-
-    preds_path.parent.mkdir(parents=True, exist_ok=True)
-
-    for i, instance in enumerate(instances):
-        instance_id = instance["instance_id"]
-        if instance_id in completed_ids:
-            continue
-
-        context_md = _load_context_md(
-            contexts_root, instance["repo"], instance["base_commit"], instance_id,
-        )
-
-        try:
-            if dry_run:
-                patch = ""
-            elif runner == "single_shot":
-                patch = generate_patch(
-                    instance=instance, model=model,
-                    context_md=context_md or None,
-                    temperature=0.0, top_p=1.0, max_tokens=1024,
-                    timeout_s=timeout_s,
-                )
-            elif runner == "mini_swe_agent":
-                patch = generate_patch_with_mini(
-                    instance=instance, model=model,
-                    context_md=context_md or None,
-                    timeout_s=timeout_s, cost_limit=0.0,
-                )
-            elif runner == "mini_swe_agent_swebench":
-                patch = generate_patch_with_mini_swebench(
-                    instance=instance, model=model,
-                    context_md=context_md or None,
-                    timeout_s=timeout_s,
-                    traj_dir=logs_dir / "trajectories",
-                    step_limit=step_limit,
-                )
-            else:
-                raise ValueError(f"Unknown runner: {runner}")
-        except Exception as exc:
-            print(f"  Inference error for {instance_id}: {exc}", file=sys.stderr)
-            patch = ""
-
-        record = {
-            "instance_id": instance_id,
-            "model_name_or_path": model,
-            "model_patch": patch,
-        }
-        line = json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n"
-        with preds_path.open("a", encoding="utf-8") as f:
-            f.write(line)
-
-        status = "OK" if patch else "EMPTY"
-        print(f"  [{i+1}/{len(instances)}] {instance_id} -> {status}")
-
-
-def run_adaptive_loop(
-    *,
-    loop_id: str,
-    model: str,
-    runner: str,
-    rounds: int,
-    conditions: list[str],
-    tasks_file: str | None,
-    swesmith_source: str | None,
-    swesmith_generate_cmd: str | None,
-    timeout_s: int,
-    step_limit: int,
-    max_workers_eval: int,
-    dataset_name: str,
-    split: str,
-    policy_file: str | None,
-    force: bool,
-    dry_run: bool = False,
-) -> Path:
-    loop_root = RESULTS_DIR / loop_id
-    logs_root = loop_root / "logs"
-    policies_root = loop_root / "policies"
-    tasks_root = loop_root / "tasks"
-    state_path = loop_root / "loop_state.json"
-
-    loop_root.mkdir(parents=True, exist_ok=True)
-    logs_root.mkdir(parents=True, exist_ok=True)
-    policies_root.mkdir(parents=True, exist_ok=True)
-    tasks_root.mkdir(parents=True, exist_ok=True)
-
-    if state_path.exists() and not force:
-        state = read_loop_state(state_path)
+    if state_path.exists():
+        state = ExperimentState.load(state_path)
     else:
-        state = LoopState(
-            loop_id=loop_id,
-            model=model,
-            runner=runner,
+        state = ExperimentState(
+            experiment_id=config.experiment_id,
             created_at=datetime.now(timezone.utc).isoformat(),
-            rounds=[],
+        )
+        state.save(state_path)
+
+    # Save config
+    config_path = exp_root / "experiment_config.json"
+    config_path.write_text(json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8")
+
+    # ── Phase 1: Tuning ────────────────────────────────────────
+    guidance_map: dict[str, RepoGuidance] = {}  # repo -> best guidance
+
+    for repo_info in config.repos:
+        repo = repo_info["repo"]
+        commit = repo_info["commit"]
+        tasks_file = repo_info["tasks_file"]
+
+        if repo in state.tuning_completed:
+            # Load previously tuned guidance
+            g_path = exp_root / "guidance" / repo.replace("/", "__") / "best_guidance.json"
+            if g_path.exists():
+                guidance_map[repo] = RepoGuidance.load(g_path)
+                print(f"[experiment] Skipping tuning for {repo} (already done)")
+                continue
+
+        print(f"\n{'='*60}")
+        print(f"[experiment] Tuning guidance for {repo}")
+        print(f"{'='*60}")
+
+        tc = TuningConfig(
+            repo=repo,
+            commit=commit,
+            tasks_file=tasks_file,
+            model=config.model,
+            iterations=config.iterations,
+            candidates_per_iter=config.candidates_per_iter,
+            tasks_per_score=config.tasks_per_score,
+            char_budget=config.char_budget,
+            timeout_s=config.timeout_s,
+            step_limit=config.step_limit,
+            output_dir=str(exp_root / "guidance" / repo.replace("/", "__")),
         )
 
-    current_policy = load_policy(policy_file) if policy_file else default_policy()
-    if not current_policy.get("policy_version"):
-        current_policy["policy_version"] = "v0"
-    current_policy_path = policies_root / f"{current_policy['policy_version']}.json"
-    if not current_policy_path.exists():
-        write_policy(current_policy_path, current_policy)
-
-    completed_rounds = {round_state.round_index for round_state in state.rounds}
-
-    for round_index in range(1, rounds + 1):
-        round_id = f"{loop_id}__r{round_index:02d}"
-        round_logs = logs_root / round_id
-        round_logs.mkdir(parents=True, exist_ok=True)
-
-        if round_index in completed_rounds and not force:
-            continue
-
-        round_tasks_file = tasks_root / f"{round_id}.jsonl"
-        if swesmith_generate_cmd:
-            count = generate_swesmith_tasks(
-                swesmith_generate_cmd,
-                round_tasks_file,
-                round_index=round_index,
-            )
-            print(f"Round {round_index}: generated {count} SWE-Smith tasks")
-        elif swesmith_source:
-            count = import_swesmith_tasks(swesmith_source, round_tasks_file)
-            print(f"Round {round_index}: imported {count} SWE-Smith tasks")
-        elif tasks_file:
-            imported = import_swesmith_tasks(tasks_file, round_tasks_file)
-            print(f"Round {round_index}: imported {imported} tasks")
+        if dry_run:
+            g = RepoGuidance(repo=repo, commit=commit, lines=["- (dry run)"], version=0)
+            g_out = Path(tc.output_dir)
+            g_out.mkdir(parents=True, exist_ok=True)
+            g.save(g_out / "best_guidance.json")
+            guidance_map[repo] = g
         else:
-            raise ValueError("Provide one of: --tasks_file, --swesmith_source, --swesmith_generate_cmd")
+            best = run_tuning_loop(tc)
+            guidance_map[repo] = best
 
-        policy_path = policies_root / f"{current_policy['policy_version']}.json"
-        if not policy_path.exists():
-            write_policy(policy_path, current_policy)
+        state.tuning_completed.append(repo)
+        state.save(state_path)
 
-        contexts_base = Path("artifacts") / "contexts" / loop_id / f"r{round_index:02d}"
-        baseline_contexts_root = contexts_base / "baseline"
-        tuned_contexts_root = contexts_base / "tuned"
+    # ── Phase 2: Verified evaluation ───────────────────────────
+    print(f"\n{'='*60}")
+    print(f"[experiment] Phase 2: SWE-bench Verified evaluation")
+    print(f"{'='*60}")
 
-        # Load instances for this round
-        instances = load_instances(
-            dataset_name=dataset_name,
-            split=split,
-            tasks_file=str(round_tasks_file),
+    instance_ids = None
+    if config.eval_instance_ids_file:
+        instance_ids = read_instance_ids(config.eval_instance_ids_file)
+
+    eval_instances = load_instances(
+        dataset_name=config.eval_dataset,
+        split=config.eval_split,
+        instance_ids=instance_ids,
+    )
+    print(f"  Loaded {len(eval_instances)} eval instances")
+
+    # Group instances by repo
+    instances_by_repo: dict[str, list[dict]] = {}
+    for inst in eval_instances:
+        instances_by_repo.setdefault(inst["repo"], []).append(inst)
+
+    conditions = ["no_context", "tuned_context"]
+    eval_results: dict[str, dict] = {}
+
+    for condition in conditions:
+        cond_preds_path = PREDS_DIR / config.experiment_id / condition / "preds.jsonl"
+        cond_preds_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Resume support
+        completed_ids: set[str] = set()
+        if cond_preds_path.exists():
+            completed_ids = {r["instance_id"] for r in read_jsonl(cond_preds_path)}
+
+        total_instances = sum(len(v) for v in instances_by_repo.values())
+        done_count = len(completed_ids)
+
+        for repo, instances in instances_by_repo.items():
+            key = f"{repo}__{condition}"
+            if key in state.eval_completed:
+                continue
+
+            guidance_text = None
+            if condition == "tuned_context" and repo in guidance_map:
+                guidance_text = guidance_map[repo].render()
+
+            for i, instance in enumerate(instances):
+                iid = instance["instance_id"]
+                if iid in completed_ids:
+                    continue
+
+                try:
+                    if dry_run:
+                        patch = ""
+                    else:
+                        patch = generate_patch_with_mini_swebench(
+                            instance=instance,
+                            model=config.model,
+                            context_md=guidance_text,
+                            timeout_s=config.timeout_s,
+                            step_limit=config.step_limit,
+                            traj_dir=PREDS_DIR / config.experiment_id / condition / "trajectories",
+                        )
+                except Exception as exc:
+                    print(f"  Eval error {iid}: {exc}", file=sys.stderr)
+                    patch = ""
+
+                record = {
+                    "instance_id": iid,
+                    "model_name_or_path": config.model,
+                    "model_patch": patch,
+                }
+                with cond_preds_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+
+                done_count += 1
+                status = "OK" if patch else "EMPTY"
+                print(f"  [{condition}] [{done_count}/{total_instances}] {iid} -> {status}")
+
+            state.eval_completed.append(key)
+            state.save(state_path)
+
+        # Run SWE-bench evaluation harness
+        run_id = f"{config.experiment_id}__{condition}"
+        eval_cmd = [
+            "bash", "scripts/run_swebench_eval.sh",
+            config.eval_dataset,
+            str(cond_preds_path),
+            run_id,
+            str(config.max_workers_eval),
+        ]
+        logs_dir = exp_root / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        rc = subproc_run(
+            eval_cmd,
+            cwd=PROJECT_ROOT,
+            stdout_path=logs_dir / f"eval_{condition}.stdout.log",
+            stderr_path=logs_dir / f"eval_{condition}.stderr.log",
+            timeout_s=3600,
         )
-        print(f"Round {round_index}: loaded {len(instances)} instances")
+        if rc != 0:
+            print(f"  WARNING: eval harness failed for {condition}")
 
-        # Build contexts in-process
-        baseline_policy = default_policy()
-        baseline_policy["policy_version"] = "baseline"
-
-        print(f"Round {round_index}: building baseline contexts...")
-        baseline_ok = _build_contexts(
-            instances=instances,
-            policy=baseline_policy,
-            model=model,
-            contexts_root=baseline_contexts_root,
-            round_id=round_id,
-            source_task_batch=str(round_tasks_file),
-            timeout_s=timeout_s,
-            dry_run=dry_run,
-        )
-        print(f"  baseline contexts built: {baseline_ok}/{len(instances)}")
-
-        print(f"Round {round_index}: building tuned contexts...")
-        tuned_ok = _build_contexts(
-            instances=instances,
-            policy=current_policy,
-            model=model,
-            contexts_root=tuned_contexts_root,
-            round_id=round_id,
-            source_task_batch=str(round_tasks_file),
-            timeout_s=timeout_s,
-            dry_run=dry_run,
-        )
-        print(f"  tuned contexts built: {tuned_ok}/{len(instances)}")
-
-        round_results: dict[str, dict] = {}
-
-        for condition in conditions:
-            cond_run_id = f"{round_id}__{condition}"
-            preds_path = PREDS_DIR / loop_id / f"r{round_index:02d}" / condition / "preds.jsonl"
-            cond_logs = logs_root / round_id / condition
-
-            if condition == "baseline":
-                cond_contexts_root = baseline_contexts_root
-            elif condition == "tuned":
-                cond_contexts_root = tuned_contexts_root
-            else:
-                raise ValueError(f"Unsupported condition: {condition}. Expected baseline,tuned")
-
-            # Run inference in-process
-            print(f"Round {round_index}: running inference ({condition})...")
-            _run_inference(
-                instances=instances,
-                model=model,
-                runner=runner,
-                contexts_root=cond_contexts_root,
-                preds_path=preds_path,
-                logs_dir=cond_logs,
-                timeout_s=timeout_s,
-                step_limit=step_limit,
-                dry_run=dry_run,
-            )
-
-            # Evaluation (external — needs Docker/SWE-bench harness)
-            eval_cmd = [
-                "bash", "scripts/run_swebench_eval.sh",
-                dataset_name,
-                str(preds_path),
-                cond_run_id,
-                str(max_workers_eval),
-            ]
-            round_logs = logs_root / round_id
-            round_logs.mkdir(parents=True, exist_ok=True)
-            if _run_step(f"r{round_index:02d}_eval_{condition}", eval_cmd, round_logs, timeout_s=3600) != 0:
-                print(f"Warning: evaluation failed for condition {condition}")
-
-            cond_results_dir = RESULTS_DIR / cond_run_id
-            resolved, total = load_results(cond_results_dir)
-            instance_records = load_instance_records(cond_results_dir)
-            failure_taxonomy = summarize_failure_taxonomy(instance_records)
-            round_results[condition] = {
-                "run_id": cond_run_id,
+        # Load results
+        try:
+            from context_policy.report.summarize import compute_rate, load_results
+            resolved, total = load_results(RESULTS_DIR / run_id)
+            eval_results[condition] = {
+                "run_id": run_id,
                 "resolved": resolved,
                 "total": total,
                 "rate": compute_rate(resolved, total),
-                "failure_taxonomy": failure_taxonomy,
-                "instance_record_count": len(instance_records),
-                "preds_path": str(preds_path),
-                "results_dir": str(cond_results_dir),
+                "preds_path": str(cond_preds_path),
             }
+        except Exception as exc:
+            print(f"  WARNING: could not load results for {condition}: {exc}")
+            eval_results[condition] = {"error": str(exc)}
 
-        baseline = round_results.get("baseline")
-        tuned = round_results.get("tuned")
-        delta = None
-        if baseline and tuned and baseline["total"]:
-            delta_resolved = tuned["resolved"] - baseline["resolved"]
-            delta = {
-                "resolved": delta_resolved,
-                "rate": delta_resolved / baseline["total"],
-            }
+    # ── Summary ────────────────────────────────────────────────
+    summary = {
+        "experiment_id": config.experiment_id,
+        "model": config.model,
+        "repos": [r["repo"] for r in config.repos],
+        "tuning_config": {
+            "iterations": config.iterations,
+            "candidates_per_iter": config.candidates_per_iter,
+            "tasks_per_score": config.tasks_per_score,
+        },
+        "eval_results": eval_results,
+    }
 
-        round_summary = {
-            "loop_id": loop_id,
-            "round_index": round_index,
-            "round_id": round_id,
-            "policy_version": current_policy["policy_version"],
-            "policy_file": str(policy_path),
-            "task_batch_file": str(round_tasks_file),
-            "conditions": round_results,
-            "delta": delta,
+    nc = eval_results.get("no_context", {})
+    tc = eval_results.get("tuned_context", {})
+    if "rate" in nc and "rate" in tc:
+        summary["delta"] = {
+            "absolute": tc["rate"] - nc["rate"],
+            "no_context_rate": nc["rate"],
+            "tuned_context_rate": tc["rate"],
         }
-        _write_json(loop_root / f"round_{round_index:02d}_summary.json", round_summary)
 
-        next_policy_version = f"v{round_index}"
-        next_policy = update_policy_with_llm(
-            model=model,
-            current_policy=current_policy,
-            round_summary=round_summary,
-            next_version=next_policy_version,
-            timeout_s=timeout_s,
-        )
-        next_policy_path = policies_root / f"{next_policy_version}.json"
-        write_policy(next_policy_path, next_policy)
-        current_policy = next_policy
+    summary_path = exp_root / "experiment_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(f"\n[experiment] Summary written to {summary_path}")
+    print(json.dumps(summary, indent=2))
 
-        state.rounds.append(
-            RoundState(
-                round_index=round_index,
-                round_id=round_id,
-                policy_version=round_summary["policy_version"],
-                task_batch_file=str(round_tasks_file),
-                conditions=conditions,
-                results=round_results,
-            )
-        )
-        write_loop_state(state_path, state)
-
-    return state_path
+    return exp_root

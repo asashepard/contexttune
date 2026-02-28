@@ -73,11 +73,14 @@ USER_TEMPLATE = """\
 - Make minimal, focused changes
 - Do not include unrelated modifications"""
 
-CONTEXT_BLOCK_TEMPLATE = """
+GUIDANCE_BLOCK_TEMPLATE = """
 
-======BEGIN_REPO_CONTEXT=====
-{context_md}
-======END_REPO_CONTEXT====="""
+# REPO GUIDANCE (AUTO-TUNED)
+{guidance_text}
+# END REPO GUIDANCE"""
+
+# Legacy alias for backward compatibility
+CONTEXT_BLOCK_TEMPLATE = GUIDANCE_BLOCK_TEMPLATE
 
 
 def build_messages(
@@ -86,6 +89,7 @@ def build_messages(
     commit: str,
     repo_dir: Path,
     context_md: str | None = None,
+    guidance_text: str | None = None,
 ) -> list[dict]:
     """Build OpenAI-format messages for patch generation.
 
@@ -94,11 +98,15 @@ def build_messages(
         repo: Repository in format "owner/name".
         commit: Commit SHA.
         repo_dir: Path to the checked-out repository.
-        context_md: Optional additional context to append.
+        context_md: Deprecated alias for guidance_text.
+        guidance_text: Optional guidance block to append.
 
     Returns:
         List of message dicts with 'role' and 'content' keys.
     """
+    # Support both old and new parameter names
+    text = guidance_text or context_md
+
     tree = _build_tree(repo_dir, max_depth=2)
 
     user_content = USER_TEMPLATE.format(
@@ -108,9 +116,9 @@ def build_messages(
         tree=tree,
     )
 
-    # Append context block if provided
-    if context_md:
-        user_content += CONTEXT_BLOCK_TEMPLATE.format(context_md=context_md)
+    # Append guidance block if provided
+    if text:
+        user_content += GUIDANCE_BLOCK_TEMPLATE.format(guidance_text=text)
 
     return [
         {"role": "system", "content": SYSTEM_PROMPT},

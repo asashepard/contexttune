@@ -89,6 +89,18 @@ def chat_completion(
                 status = getattr(e.response, "status_code", None)
                 if status and 400 <= status < 500:
                     body = e.response.text[:1200]
+
+                    # OpenAI newer models may reject `max_tokens` and require
+                    # `max_completion_tokens`. If so, switch payload and retry.
+                    if (
+                        "unsupported_parameter" in body
+                        and "max_tokens" in body
+                        and "max_completion_tokens" in body
+                        and "max_tokens" in payload
+                    ):
+                        payload.pop("max_tokens", None)
+                        payload["max_completion_tokens"] = max_tokens
+
                     last_error = RuntimeError(f"HTTP {status}: {body}")
             if attempt < max_retries - 1:
                 # Exponential backoff; extra wait on rate-limit

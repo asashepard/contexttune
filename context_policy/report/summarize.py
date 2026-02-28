@@ -6,6 +6,31 @@ import json
 from pathlib import Path
 
 
+def _candidate_eval_dirs(results_dir: Path) -> list[Path]:
+    """Return possible directories where SWE-bench may write outputs.
+
+    Historically we've looked under ``results/<run_id>``. Some harness
+    versions write under ``logs/run_evaluation/<run_id>`` unless an output
+    directory is explicitly provided.
+    """
+    dirs = [results_dir]
+
+    # If caller passed PROJECT_ROOT/results/<run_id>, also probe
+    # PROJECT_ROOT/logs/run_evaluation/<run_id>.
+    run_id = results_dir.name
+    project_root = results_dir.parent.parent
+    dirs.append(project_root / "logs" / "run_evaluation" / run_id)
+
+    # De-duplicate while preserving order.
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
 def load_results(results_dir: Path) -> tuple[int, int]:
     """Load results from a SWE-bench evaluation directory.
 
@@ -14,47 +39,57 @@ def load_results(results_dir: Path) -> tuple[int, int]:
     Returns:
         (resolved, total) counts.
     """
-    # Try results.json first (summary file from harness)
-    results_json = results_dir / "results.json"
-    if results_json.exists():
-        try:
-            data = json.loads(results_json.read_text(encoding="utf-8"))
-            # Handle different result formats
-            if isinstance(data, dict):
-                # Format: {"resolved": [...], "applied": [...], ...}
-                resolved_list = data.get("resolved", [])
-                # Total = resolved + unresolved (or count from applied)
-                applied_list = data.get("applied", [])
-                if applied_list:
-                    total = len(applied_list)
-                else:
-                    # Fallback: count all instances mentioned
-                    all_ids = set()
-                    for key in ["resolved", "applied", "failed", "error"]:
-                        all_ids.update(data.get(key, []))
-                    total = len(all_ids) if all_ids else len(resolved_list)
-                return len(resolved_list), total
-        except (json.JSONDecodeError, KeyError):
-            pass  # Fall through to jsonl
-
-    # Fallback: parse instance_results.jsonl
-    instance_results = results_dir / "instance_results.jsonl"
-    if instance_results.exists():
-        resolved = 0
-        total = 0
-        for line in instance_results.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
+    for eval_dir in _candidate_eval_dirs(results_dir):
+        # Try results.json first (summary file from harness)
+        results_json = eval_dir / "results.json"
+        if results_json.exists():
             try:
-                record = json.loads(line)
-                total += 1
-                # Check for resolved/passed field (various formats)
-                if record.get("resolved") or record.get("passed"):
-                    resolved += 1
-            except json.JSONDecodeError:
-                continue
-        return resolved, total
+                data = json.loads(results_json.read_text(encoding="utf-8"))
+                # Handle different result formats
+                if isinstance(data, dict):
+                    # Format A: {"resolved": [...], "applied": [...], ...}
+                    resolved_field = data.get("resolved", [])
+                    applied_field = data.get("applied", [])
+
+                    resolved_count = (
+                        resolved_field if isinstance(resolved_field, int) else len(resolved_field)
+                    )
+
+                    if isinstance(applied_field, int):
+                        total = applied_field
+                    elif applied_field:
+                        total = len(applied_field)
+                    else:
+                        # Fallback: count all instances mentioned by known keys.
+                        all_ids = set()
+                        for key in ["resolved", "applied", "failed", "error", "unresolved"]:
+                            value = data.get(key, [])
+                            if isinstance(value, list):
+                                all_ids.update(value)
+                        total = len(all_ids) if all_ids else resolved_count
+
+                    return int(resolved_count), int(total)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                pass  # Fall through to jsonl in same dir
+
+        # Fallback: parse instance_results.jsonl
+        instance_results = eval_dir / "instance_results.jsonl"
+        if instance_results.exists():
+            resolved = 0
+            total = 0
+            for line in instance_results.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    total += 1
+                    # Check for resolved/passed field (various formats)
+                    if record.get("resolved") or record.get("passed"):
+                        resolved += 1
+                except json.JSONDecodeError:
+                    continue
+            return resolved, total
 
     # No results found
     return 0, 0
@@ -67,20 +102,22 @@ def compute_rate(resolved: int, total: int) -> float:
 
 def load_instance_records(results_dir: Path) -> list[dict]:
     """Load per-instance harness records when available."""
-    instance_results = results_dir / "instance_results.jsonl"
-    if not instance_results.exists():
-        return []
+    for eval_dir in _candidate_eval_dirs(results_dir):
+        instance_results = eval_dir / "instance_results.jsonl"
+        if not instance_results.exists():
+            continue
 
-    records: list[dict] = []
-    for raw_line in instance_results.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records
+        records: list[dict] = []
+        for raw_line in instance_results.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return records
+    return []
 
 
 def classify_failure(record: dict) -> str:

@@ -31,6 +31,39 @@ from context_policy.runner.patch_utils import (
 DEFAULT_MAX_STEPS = 30
 
 
+def _first_nonempty_env(*keys: str) -> str | None:
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
+def _litellm_model_kwargs_from_env() -> dict[str, Any]:
+    """Build explicit LiteLLM kwargs from env to avoid provider fallback."""
+    model_kwargs: dict[str, Any] = {}
+
+    api_base = _first_nonempty_env("OPENAI_BASE_URL", "OPENAI_API_BASE", "LITELLM_API_BASE")
+    if api_base:
+        model_kwargs["api_base"] = api_base
+        os.environ["OPENAI_API_BASE"] = api_base
+
+    api_key = _first_nonempty_env("OPENAI_API_KEY", "LITELLM_API_KEY")
+    if api_key:
+        model_kwargs["api_key"] = api_key
+        os.environ["OPENAI_API_KEY"] = api_key
+
+    custom_provider = _first_nonempty_env("LITELLM_CUSTOM_LLM_PROVIDER")
+    if custom_provider:
+        model_kwargs["custom_llm_provider"] = custom_provider
+
+    api_version = _first_nonempty_env("OPENAI_API_VERSION", "LITELLM_API_VERSION")
+    if api_version:
+        model_kwargs["api_version"] = api_version
+
+    return model_kwargs
+
+
 def _sum_int(v: Any) -> int:
     try:
         return int(v)
@@ -335,7 +368,11 @@ def _run_agent_in_docker(
         container_id = _get_running_container_id()
         print(f"  Container ID after env init: {container_id}")
 
-        model_instance = LitellmModel(model_name=model)
+        model_kwargs = _litellm_model_kwargs_from_env()
+        debug_base = model_kwargs.get("api_base") or "<default>"
+        debug_provider = model_kwargs.get("custom_llm_provider") or "<auto>"
+        print(f"  Model routing: model={model!r}, api_base={debug_base!r}, provider={debug_provider!r}")
+        model_instance = LitellmModel(model_name=model, model_kwargs=model_kwargs)
 
         # Override step_limit and cost_limit with our experiment values.
         # cost_limit default is $3 which may trigger LimitsExceeded prematurely.

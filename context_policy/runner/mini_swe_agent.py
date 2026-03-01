@@ -134,8 +134,13 @@ def generate_patch_with_mini(
 
         # Run mini-swe-agent in the repo directory
         env = os.environ.copy()
-        # Ensure OpenAI env vars are passed through
-        # (mini-swe-agent uses litellm which reads these)
+        # Normalize env var aliases used by different OpenAI-compatible clients.
+        # mini-swe-agent/litellm commonly reads OPENAI_API_BASE, while this repo
+        # documents OPENAI_BASE_URL.
+        if env.get("OPENAI_BASE_URL") and not env.get("OPENAI_API_BASE"):
+            env["OPENAI_API_BASE"] = env["OPENAI_BASE_URL"]
+        if env.get("LITELLM_API_KEY") and not env.get("OPENAI_API_KEY"):
+            env["OPENAI_API_KEY"] = env["LITELLM_API_KEY"]
 
         result = subprocess.run(
             cmd,

@@ -51,16 +51,9 @@ def _normalize_repo_slug(value: str | None) -> str:
     return v
 
 
-def _repo_from_instance_id(instance_id: str | None) -> str:
-    """Best-effort derive repo slug from SWE-style instance_id."""
-    if not instance_id:
-        return ""
-    iid = str(instance_id)
-    # Common format: owner__repo-12345
-    head = iid.split("-", 1)[0]
-    if "__" in head:
-        return _normalize_repo_slug(head)
-    return ""
+def _repo_to_hf_key(repo: str) -> str:
+    """Convert canonical owner/name into SWE-smith HF key owner__name."""
+    return repo.replace("/", "__").lower()
 
 
 def generate_tasks_swesmith(
@@ -98,14 +91,28 @@ def generate_tasks_swesmith(
 
 def _row_to_task(row: dict, repo: str, default_commit: str) -> dict | None:
     """Normalize a SWE-smith row into our task contract."""
-    instance_id = row.get("instance_id") or row.get("id")
-    row_repo = (
+    instance_id = str(row.get("instance_id") or row.get("id") or "")
+    row_repo = str(
         row.get("repo")
         or row.get("repository")
         or row.get("repo_name")
         or row.get("repo_slug")
-        or _repo_from_instance_id(instance_id)
+        or ""
     )
+    repo_key = _repo_to_hf_key(repo)
+    repo_prefix = f"swesmith/{repo_key}."
+    iid_prefix = f"{repo_key}."
+
+    row_repo_lower = row_repo.lower()
+    iid_lower = instance_id.lower()
+    if not (
+        row_repo_lower.startswith(repo_prefix)
+        or iid_lower.startswith(iid_prefix)
+    ):
+        return None
+
+    # In HF fallback mode, commit pinning is intentionally ignored.
+    # Rows are already tied to a dataset snapshot commit/hash.
     base_commit = (
         row.get("base_commit")
         or row.get("commit")
@@ -122,14 +129,12 @@ def _row_to_task(row: dict, repo: str, default_commit: str) -> dict | None:
         or row.get("text")
         or ""
     )
-    if not instance_id or not row_repo or not base_commit:
-        return None
-    if _normalize_repo_slug(str(row_repo)) != _normalize_repo_slug(repo):
+    if not instance_id or not base_commit:
         return None
 
     return {
         "instance_id": str(instance_id),
-        "repo": _normalize_repo_slug(str(row_repo)),
+        "repo": repo,
         "base_commit": str(base_commit),
         "problem_statement": str(problem_statement),
         "source": "swe_smith_hf",
@@ -149,45 +154,38 @@ def generate_tasks_from_hf(repo: str, commit: str, n: int, output_path: Path) ->
         ) from exc
 
     ds = load_dataset("SWE-bench/SWE-smith", split="train")
-    rows = []
-    seen_repos: dict[str, int] = {}
-    for row in ds:
-        rowd = dict(row)
-        observed_repo = (
-            rowd.get("repo")
-            or rowd.get("repository")
-            or rowd.get("repo_name")
-            or rowd.get("repo_slug")
-            or _repo_from_instance_id(rowd.get("instance_id") or rowd.get("id"))
-        )
-        normalized_observed = _normalize_repo_slug(observed_repo)
-        if normalized_observed:
-            seen_repos[normalized_observed] = seen_repos.get(normalized_observed, 0) + 1
 
-        task = _row_to_task(rowd, repo=repo, default_commit=commit)
+    repo_key = _repo_to_hf_key(repo)
+    repo_prefix = f"swesmith/{repo_key}."
+    iid_prefix = f"{repo_key}."
+
+    hits = ds.filter(
+        lambda x: str(x.get("repo", "")).lower().startswith(repo_prefix)
+        or str(x.get("instance_id", "")).lower().startswith(iid_prefix),
+        num_proc=1,
+    )
+
+    if len(hits) == 0:
+        raise RuntimeError(
+            f"No SWE-smith HF rows found for repo={repo}. "
+            f"Tried repo_prefix={repo_prefix} iid_prefix={iid_prefix}."
+        )
+
+    # HF fallback ignores caller commit pin and samples from available repo rows.
+    if n < len(hits):
+        hits = hits.shuffle(seed=0).select(range(n))
+
+    rows = []
+    for row in hits:
+        task = _row_to_task(dict(row), repo=repo, default_commit=commit)
         if task is not None:
             rows.append(task)
 
     if not rows:
-        target = _normalize_repo_slug(repo)
-        sample_repos = sorted(seen_repos.items(), key=lambda kv: kv[1], reverse=True)[:15]
-        sample_text = ", ".join(f"{k}({v})" for k, v in sample_repos) if sample_repos else "<none>"
         raise RuntimeError(
-            f"No SWE-smith HF rows found for repo={repo} (normalized={target}). "
-            f"Observed repo values include: {sample_text}"
+            f"Filtered HF rows for repo={repo}, but failed normalization. "
+            f"Tried repo_prefix={repo_prefix} iid_prefix={iid_prefix}."
         )
-
-    # Prefer matching commit when caller specified one; otherwise keep repo-wide set.
-    if commit != "HEAD":
-        commit_rows = [r for r in rows if r.get("base_commit") == commit]
-        if commit_rows:
-            rows = commit_rows
-
-    # Stable pseudo-random sample for reproducibility across runs.
-    seed = abs(hash(f"{repo}:{commit}")) % (2 ** 32)
-    rng = random.Random(seed)
-    rng.shuffle(rows)
-    rows = rows[:n]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:

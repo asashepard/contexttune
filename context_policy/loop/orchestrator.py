@@ -17,7 +17,7 @@ from pathlib import Path
 from context_policy.datasets.swebench import load_instances, read_instance_ids
 from context_policy.guidance.schema import RepoGuidance
 from context_policy.guidance.tuner import TuningConfig, run_tuning_loop
-from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench
+from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench_result
 from context_policy.utils.jsonl import read_jsonl
 from context_policy.utils.paths import PREDS_DIR, PROJECT_ROOT, RESULTS_DIR
 from context_policy.utils.subproc import run as subproc_run
@@ -180,11 +180,26 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
     for condition in conditions:
         cond_preds_path = PREDS_DIR / config.experiment_id / condition / "preds.jsonl"
         cond_preds_path.parent.mkdir(parents=True, exist_ok=True)
+        cond_metrics_path = exp_root / "metrics" / f"{condition}_instances.jsonl"
+        cond_metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Resume support
         completed_ids: set[str] = set()
+        completed_metrics: dict[str, dict] = {}
         if cond_preds_path.exists():
             completed_ids = {r["instance_id"] for r in read_jsonl(cond_preds_path)}
+        if cond_metrics_path.exists():
+            for rec in read_jsonl(cond_metrics_path):
+                completed_metrics[rec["instance_id"]] = rec
+
+        condition_elapsed_s = 0.0
+        condition_non_empty = 0
+        condition_total = 0
+        condition_tokens = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
         total_instances = sum(len(v) for v in instances_by_repo.values())
         done_count = len(completed_ids)
@@ -201,13 +216,33 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
             for i, instance in enumerate(instances):
                 iid = instance["instance_id"]
                 if iid in completed_ids:
+                    prev = completed_metrics.get(iid)
+                    if prev:
+                        condition_elapsed_s += float(prev.get("elapsed_s", 0.0) or 0.0)
+                        if prev.get("patch_non_empty"):
+                            condition_non_empty += 1
+                        usage = prev.get("token_usage", {})
+                        condition_tokens["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+                        condition_tokens["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+                        condition_tokens["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+                        condition_total += 1
                     continue
 
                 try:
                     if dry_run:
                         patch = ""
+                        run_meta = {
+                            "elapsed_s": 0.0,
+                            "token_usage": {
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0,
+                            },
+                            "status": "dry_run",
+                            "error": None,
+                        }
                     else:
-                        patch = generate_patch_with_mini_swebench(
+                        run_meta = generate_patch_with_mini_swebench_result(
                             instance=instance,
                             model=config.model,
                             context_md=guidance_text,
@@ -215,9 +250,20 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
                             step_limit=config.step_limit,
                             traj_dir=PREDS_DIR / config.experiment_id / condition / "trajectories",
                         )
+                        patch = run_meta.get("patch", "")
                 except Exception as exc:
                     print(f"  Eval error {iid}: {exc}", file=sys.stderr)
                     patch = ""
+                    run_meta = {
+                        "elapsed_s": 0.0,
+                        "token_usage": {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                        "status": "error",
+                        "error": str(exc),
+                    }
 
                 record = {
                     "instance_id": iid,
@@ -226,6 +272,32 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
                 }
                 with cond_preds_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+
+                usage = run_meta.get("token_usage", {}) if isinstance(run_meta, dict) else {}
+                metrics_record = {
+                    "instance_id": iid,
+                    "repo": repo,
+                    "condition": condition,
+                    "elapsed_s": float(run_meta.get("elapsed_s", 0.0) or 0.0),
+                    "patch_non_empty": bool(patch and patch.strip()),
+                    "status": run_meta.get("status", "ok"),
+                    "error": run_meta.get("error"),
+                    "token_usage": {
+                        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+                        "total_tokens": int(usage.get("total_tokens", 0) or 0),
+                    },
+                }
+                with cond_metrics_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(metrics_record, sort_keys=True, ensure_ascii=False) + "\n")
+
+                condition_elapsed_s += metrics_record["elapsed_s"]
+                if metrics_record["patch_non_empty"]:
+                    condition_non_empty += 1
+                condition_total += 1
+                condition_tokens["prompt_tokens"] += metrics_record["token_usage"]["prompt_tokens"]
+                condition_tokens["completion_tokens"] += metrics_record["token_usage"]["completion_tokens"]
+                condition_tokens["total_tokens"] += metrics_record["token_usage"]["total_tokens"]
 
                 done_count += 1
                 status = "OK" if patch else "EMPTY"
@@ -266,6 +338,15 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
                 "total": total,
                 "rate": compute_rate(resolved, total),
                 "preds_path": str(cond_preds_path),
+                "instance_metrics_path": str(cond_metrics_path),
+                "generation_metrics": {
+                    "instances_processed": condition_total,
+                    "patch_non_empty": condition_non_empty,
+                    "patch_non_empty_rate": (condition_non_empty / condition_total) if condition_total else 0.0,
+                    "elapsed_s": condition_elapsed_s,
+                    "mean_elapsed_s": (condition_elapsed_s / condition_total) if condition_total else 0.0,
+                    "token_usage": condition_tokens,
+                },
             }
         except Exception as exc:
             print(f"  WARNING: could not load results for {condition}: {exc}")

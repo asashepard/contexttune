@@ -23,11 +23,14 @@ from pathlib import Path
 from context_policy.guidance.init import initialize_guidance
 from context_policy.guidance.propose import propose_candidates
 from context_policy.guidance.schema import DEFAULT_CHAR_BUDGET, RepoGuidance
-from context_policy.guidance.score import score_candidate
+from context_policy.guidance.score import ScoreResult, score_candidate_detailed
 from context_policy.git.checkout import checkout_repo
 
 
 # ── configuration ──────────────────────────────────────────────
+
+
+MAX_TUNING_ITERATIONS = 20
 
 
 @dataclass
@@ -53,6 +56,18 @@ class TuningConfig:
 
     # Output paths
     output_dir: str = ""  # set by caller
+
+    def __post_init__(self) -> None:
+        if self.iterations < 0:
+            raise ValueError("iterations must be >= 0")
+        if self.iterations > MAX_TUNING_ITERATIONS:
+            raise ValueError(
+                f"iterations={self.iterations} exceeds cap {MAX_TUNING_ITERATIONS}"
+            )
+        if self.candidates_per_iter <= 0:
+            raise ValueError("candidates_per_iter must be > 0")
+        if self.tasks_per_score <= 0:
+            raise ValueError("tasks_per_score must be > 0")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -111,6 +126,7 @@ def run_tuning_loop(config: TuningConfig) -> RepoGuidance:
     out.mkdir(parents=True, exist_ok=True)
 
     state_path = out / "tuning_state.json"
+    metrics_path = out / "tuning_metrics.json"
     guidance_dir = out / "versions"
     guidance_dir.mkdir(parents=True, exist_ok=True)
 
@@ -127,18 +143,39 @@ def run_tuning_loop(config: TuningConfig) -> RepoGuidance:
         else:
             # State file exists but guidance is missing — re-init
             state = TuningState(repo=config.repo)
-            best, best_score = _init_and_score(config, tasks_file, guidance_dir)
+            best, best_score, init_metrics = _init_and_score(config, tasks_file, guidance_dir)
             state.best_version = best.version
             state.best_score = best_score
-            state.history.append({"version": 0, "score": best_score, "type": "init"})
+            state.history.append({
+                "version": 0,
+                "score": best_score,
+                "type": "init",
+                "resolved": init_metrics.resolved,
+                "total": init_metrics.total,
+                "instance_metrics_path": init_metrics.instance_metrics_path,
+            })
             state.save(state_path)
     else:
         state = TuningState(repo=config.repo)
-        best, best_score = _init_and_score(config, tasks_file, guidance_dir)
+        best, best_score, init_metrics = _init_and_score(config, tasks_file, guidance_dir)
         state.best_version = best.version
         state.best_score = best_score
-        state.history.append({"version": 0, "score": best_score, "type": "init"})
+        state.history.append({
+            "version": 0,
+            "score": best_score,
+            "type": "init",
+            "resolved": init_metrics.resolved,
+            "total": init_metrics.total,
+            "instance_metrics_path": init_metrics.instance_metrics_path,
+        })
         state.save(state_path)
+
+    tuning_metrics: dict = {
+        "repo": config.repo,
+        "model": config.model,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "iterations": [],
+    }
 
     # ── hill-climbing iterations ───────────────────────────────
     start_iter = state.completed_iterations + 1
@@ -171,7 +208,7 @@ def run_tuning_loop(config: TuningConfig) -> RepoGuidance:
             candidate = candidate.copy(version=candidate_version)
 
             preds_dir = out / "preds" / f"iter{t:02d}" / f"c{ci}"
-            c_score = score_candidate(
+            c_result = score_candidate_detailed(
                 guidance=candidate,
                 tasks_file=tasks_file,
                 model=config.model,
@@ -180,6 +217,7 @@ def run_tuning_loop(config: TuningConfig) -> RepoGuidance:
                 step_limit=config.step_limit,
                 preds_dir=preds_dir,
             )
+            c_score = c_result.rate
 
             state.history.append({
                 "version": candidate_version,
@@ -187,12 +225,19 @@ def run_tuning_loop(config: TuningConfig) -> RepoGuidance:
                 "type": "candidate",
                 "iteration": t,
                 "candidate_index": ci,
+                "resolved": c_result.resolved,
+                "total": c_result.total,
+                "non_empty_patches": c_result.non_empty_patches,
+                "elapsed_s": c_result.total_elapsed_s,
+                "token_usage": c_result.token_usage,
+                "instance_metrics_path": c_result.instance_metrics_path,
             })
 
             # Save candidate guidance
             candidate.save(guidance_dir / f"v{candidate_version}.json")
 
-            if c_score > best_score:
+            is_improved = c_score > best_score
+            if is_improved:
                 print(f"  ✓ Candidate {ci} (v{candidate_version}) improves: {best_score:.1%} -> {c_score:.1%}")
                 best = candidate
                 best_score = c_score
@@ -201,8 +246,23 @@ def run_tuning_loop(config: TuningConfig) -> RepoGuidance:
             else:
                 print(f"  ✗ Candidate {ci} (v{candidate_version}): {c_score:.1%} <= {best_score:.1%}")
 
+            tuning_metrics["iterations"].append({
+                "iteration": t,
+                "candidate_index": ci,
+                "version": candidate_version,
+                "score": c_score,
+                "resolved": c_result.resolved,
+                "total": c_result.total,
+                "non_empty_patch_rate": (c_result.non_empty_patches / c_result.total) if c_result.total else 0.0,
+                "elapsed_s": c_result.total_elapsed_s,
+                "token_usage": c_result.token_usage,
+                "improved_best": is_improved,
+                "instance_metrics_path": c_result.instance_metrics_path,
+            })
+
         state.completed_iterations = t
         state.save(state_path)
+        metrics_path.write_text(json.dumps(tuning_metrics, indent=2) + "\n", encoding="utf-8")
 
     # ── save final best ────────────────────────────────────────
     final_path = out / "best_guidance.json"
@@ -223,7 +283,7 @@ def _init_and_score(
     config: TuningConfig,
     tasks_file: Path,
     guidance_dir: Path,
-) -> tuple[RepoGuidance, float]:
+) -> tuple[RepoGuidance, float, ScoreResult]:
     """Initialize G₀ and score it."""
     print(f"[tune] Initializing guidance for {config.repo}...")
     repo_dir = checkout_repo(config.repo, config.commit)
@@ -239,7 +299,7 @@ def _init_and_score(
     g0.save(guidance_dir / "v0.json")
 
     print(f"[tune] Scoring G₀ ({g0.char_count()} chars, {len(g0.lines)} lines)...")
-    g0_score = score_candidate(
+    g0_result = score_candidate_detailed(
         guidance=g0,
         tasks_file=tasks_file,
         model=config.model,
@@ -247,5 +307,6 @@ def _init_and_score(
         timeout_s=config.timeout_s,
         step_limit=config.step_limit,
     )
+    g0_score = g0_result.rate
     print(f"[tune] G₀ score: {g0_score:.1%}")
-    return g0, g0_score
+    return g0, g0_score, g0_result

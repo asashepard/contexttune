@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from context_policy.guidance.tuner import TuningConfig, run_tuning_loop
+from context_policy.guidance.tuner import MAX_TUNING_ITERATIONS, TuningConfig, run_tuning_loop
 
 
 def main() -> None:
@@ -31,7 +31,12 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True)
 
-    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=10,
+        help=f"Hill-climbing iterations (0..{MAX_TUNING_ITERATIONS}).",
+    )
     parser.add_argument("--candidates", type=int, default=6)
     parser.add_argument("--tasks-per-score", type=int, default=20)
     parser.add_argument("--char-budget", type=int, default=3200)
@@ -39,6 +44,9 @@ def main() -> None:
     parser.add_argument("--step-limit", type=int, default=30)
 
     args = parser.parse_args()
+
+    if args.iterations < 0 or args.iterations > MAX_TUNING_ITERATIONS:
+        parser.error(f"--iterations must be between 0 and {MAX_TUNING_ITERATIONS}.")
 
     config = TuningConfig(
         repo=args.repo,

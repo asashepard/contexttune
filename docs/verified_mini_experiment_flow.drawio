@@ -1,0 +1,129 @@
+<mxfile host="app.diagrams.net" modified="2026-03-01T00:00:00.000Z" agent="GitHub Copilot" version="24.7.17" editor="draw.io">
+  <diagram id="verified-mini-flow" name="Verified Mini Experiment Flow">
+    <mxGraphModel dx="1600" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2400" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="ContextTune Verified Mini (50) — Experiment + Hill-Climb Loop" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=22;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="640" y="30" width="1180" height="40" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n1" value="1) Inputs&#xa;Model + 12 repos + 50 verified IDs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f1ff;strokeColor=#2f6feb;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="230" width="300" height="110" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="loopBox" value="2) Per-repo hill-climb (repeat for each repo)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8fbff;strokeColor=#2f6feb;dashed=1;dashPattern=8 6;fontSize=16;fontStyle=1;align=left;spacingLeft=10;verticalAlign=top;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="420" y="90" width="760" height="380" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="h0" value="Init G0" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f1ff;strokeColor=#2f6feb;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="460" y="160" width="200" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="h1" value="Propose K&#xa;candidates" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f1ff;strokeColor=#2f6feb;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="700" y="160" width="200" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="h2" value="Score on N SWE-smith tasks&#xa;(strict PASS/FAIL)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff4e5;strokeColor=#bc4c00;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="940" y="160" width="220" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="h3" value="Improved best score?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff4e5;strokeColor=#bc4c00;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="950" y="260" width="200" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="h4" value="Update best&#xa;guidance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3ecff;strokeColor=#8250df;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="700" y="285" width="200" height="70" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="h5" value="t &lt; T ?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#e8f1ff;strokeColor=#2f6feb;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="470" y="280" width="180" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n3" value="3) Freeze best guidance&#xa;(best_guidance.json per repo)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3ecff;strokeColor=#8250df;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="230" width="310" height="110" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n4a" value="4A) no_context run&#xa;same 50 IDs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff4e5;strokeColor=#bc4c00;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1610" y="140" width="270" height="95" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n4b" value="4B) tuned_context run&#xa;same 50 IDs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff4e5;strokeColor=#bc4c00;fontSize=15;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1610" y="315" width="270" height="95" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n5" value="5) SWE-bench eval&#xa;for both branches" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9fbe9;strokeColor=#1f883d;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1940" y="230" width="250" height="110" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="n6" value="6) Final comparison&#xa;delta = tuned - no_context&#xa;+ completion/time/tokens" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e9fbe9;strokeColor=#1f883d;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1940" y="370" width="250" height="120" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="n1" target="h0">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e2" value="start t=1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h0" target="h1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h1" target="h2">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h2" target="h3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e5" value="yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h3" target="h4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e6" value="no" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h3" target="h5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h4" target="h5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e8" value="yes: next iteration" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h5" target="h1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="520" y="400"/>
+              <mxPoint x="520" y="420"/>
+              <mxPoint x="800" y="420"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e9" value="no: finalize repo" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h5" target="n3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="n3" target="n4a">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="n3" target="n4b">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="n4a" target="n5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="n4b" target="n5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="n5" target="n6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -8,6 +8,7 @@ import os
 import queue
 import subprocess
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,63 @@ from context_policy.runner.patch_utils import (
 # Default step limit to prevent the agent from looping indefinitely.
 # Experiment spec v1.1 uses 30 steps.
 DEFAULT_MAX_STEPS = 30
+
+
+def _sum_int(v: Any) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_token_usage_from_any(node: Any) -> dict[str, int]:
+    """Best-effort recursive token extraction from arbitrary trajectory JSON."""
+    usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    def walk(x: Any) -> None:
+        if isinstance(x, dict):
+            if "usage" in x and isinstance(x["usage"], dict):
+                u = x["usage"]
+                usage["prompt_tokens"] += _sum_int(u.get("prompt_tokens", 0))
+                usage["completion_tokens"] += _sum_int(u.get("completion_tokens", 0))
+                usage["total_tokens"] += _sum_int(u.get("total_tokens", 0))
+
+            usage["prompt_tokens"] += _sum_int(x.get("input_tokens", 0))
+            usage["completion_tokens"] += _sum_int(x.get("output_tokens", 0))
+            usage["total_tokens"] += _sum_int(x.get("tokens", 0))
+
+            for value in x.values():
+                walk(value)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item)
+
+    walk(node)
+    if usage["total_tokens"] == 0:
+        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    return usage
+
+
+def _read_traj_token_usage(traj_path: Path) -> dict[str, int]:
+    if not traj_path.exists():
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+    try:
+        data = json.loads(traj_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+    return _extract_token_usage_from_any(data)
 
 
 def _docker_image_exists(image_name: str) -> bool:
@@ -436,6 +494,39 @@ def generate_patch_with_mini_swebench(
     Raises:
         RuntimeError: If Docker is not available.
     """
+    result = generate_patch_with_mini_swebench_result(
+        instance=instance,
+        model=model,
+        context_md=context_md,
+        timeout_s=timeout_s,
+        step_limit=step_limit,
+        traj_dir=traj_dir,
+    )
+    return result.get("patch", "")
+
+
+def generate_patch_with_mini_swebench_result(
+    instance: dict,
+    model: str,
+    context_md: str | None = None,
+    *,
+    timeout_s: int = 600,
+    step_limit: int = DEFAULT_MAX_STEPS,
+    traj_dir: Path | None = None,
+) -> dict:
+    """Generate patch plus structured run metadata.
+
+    Returns dict with keys:
+      - patch: unified diff or ""
+      - elapsed_s: wall-clock seconds spent for this instance
+      - token_usage: prompt/completion/total token counts when available
+      - status: one of ok, timeout, error, missing_image
+      - error: optional error message
+      - trajectory_path: optional saved trajectory path
+    """
+    started = time.perf_counter()
+    traj_path: Path | None = None
+
     # Validate Docker is available
     check_docker_available()
 
@@ -461,7 +552,14 @@ def generate_patch_with_mini_swebench(
             "  Build required images first, e.g.:\n"
             "    python scripts/build_docker_images.py --instance_ids_file <ids.txt>"
         )
-        return ""
+        return {
+            "patch": "",
+            "elapsed_s": time.perf_counter() - started,
+            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "status": "missing_image",
+            "error": f"missing_docker_image:{image_name}",
+            "trajectory_path": None,
+        }
 
     # Build task with context
     task = build_task_with_context(problem_statement, context_md)
@@ -479,6 +577,8 @@ def generate_patch_with_mini_swebench(
         )
         traj_path = Path(traj_file.name)
         traj_file.close()
+
+    trajectory_path_value = str(traj_path) if traj_path is not None else None
 
     try:
         # Run agent in separate process for timeout enforcement
@@ -511,10 +611,25 @@ def generate_patch_with_mini_swebench(
 
             if container_patch and len(container_patch) <= MAX_PATCH_SIZE:
                 print(f"  Recovered patch from container on timeout ({len(container_patch)} chars)")
-                return container_patch
+                return {
+                    "patch": container_patch,
+                    "elapsed_s": time.perf_counter() - started,
+                    "token_usage": _read_traj_token_usage(traj_path),
+                    "status": "timeout",
+                    "error": f"timeout:{timeout_s}",
+                    "trajectory_path": trajectory_path_value,
+                }
 
             # Fall back to trajectory / queue
-            return _salvage_patch(traj_path, result_queue)
+            salvage = _salvage_patch(traj_path, result_queue)
+            return {
+                "patch": salvage,
+                "elapsed_s": time.perf_counter() - started,
+                "token_usage": _read_traj_token_usage(traj_path),
+                "status": "timeout",
+                "error": f"timeout:{timeout_s}",
+                "trajectory_path": trajectory_path_value,
+            }
 
         # Get result from queue (use .get with timeout, not .empty() which is unreliable)
         try:
@@ -522,12 +637,28 @@ def generate_patch_with_mini_swebench(
         except queue.Empty:
             print("  mini-swe-agent-swebench: no result in queue")
             # Process exited without putting result — try trajectory
-            return _salvage_patch(traj_path, result_queue)
+            salvage = _salvage_patch(traj_path, result_queue)
+            return {
+                "patch": salvage,
+                "elapsed_s": time.perf_counter() - started,
+                "token_usage": _read_traj_token_usage(traj_path),
+                "status": "error",
+                "error": "no_result_in_queue",
+                "trajectory_path": trajectory_path_value,
+            }
 
         if error:
             print(f"  mini-swe-agent-swebench error: {error}")
             # Even on error, trajectory might contain a partial patch
-            return _salvage_patch(traj_path, result_queue)
+            salvage = _salvage_patch(traj_path, result_queue)
+            return {
+                "patch": salvage,
+                "elapsed_s": time.perf_counter() - started,
+                "token_usage": _read_traj_token_usage(traj_path),
+                "status": "error",
+                "error": error,
+                "trajectory_path": trajectory_path_value,
+            }
 
         # Try to extract patch from trajectory if agent didn't return it directly
         if not patch and traj_path.exists():
@@ -536,13 +667,34 @@ def generate_patch_with_mini_swebench(
         # Safety: reject oversized patches
         if patch and len(patch) > MAX_PATCH_SIZE:
             print(f"  Patch too large ({len(patch)} chars), rejecting")
-            return ""
+            return {
+                "patch": "",
+                "elapsed_s": time.perf_counter() - started,
+                "token_usage": _read_traj_token_usage(traj_path),
+                "status": "error",
+                "error": "patch_too_large",
+                "trajectory_path": trajectory_path_value,
+            }
 
-        return patch or ""
+        return {
+            "patch": patch or "",
+            "elapsed_s": time.perf_counter() - started,
+            "token_usage": _read_traj_token_usage(traj_path),
+            "status": "ok",
+            "error": None,
+            "trajectory_path": trajectory_path_value,
+        }
 
     except Exception as e:
         print(f"  mini-swe-agent-swebench error: {e}")
-        return ""
+        return {
+            "patch": "",
+            "elapsed_s": time.perf_counter() - started,
+            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "status": "error",
+            "error": str(e),
+            "trajectory_path": trajectory_path_value,
+        }
     finally:
         # Clean up temp trajectory file if we created one (keep when traj_dir is set)
         if not traj_dir:

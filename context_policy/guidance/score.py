@@ -7,12 +7,42 @@ from __future__ import annotations
 
 import json
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from context_policy.datasets.swebench import load_instances
 from context_policy.guidance.schema import RepoGuidance
-from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench
+from context_policy.runner.mini_swe_agent_swebench import (
+    generate_patch_with_mini_swebench_result,
+)
 from context_policy.utils.paths import PREDS_DIR
+
+
+@dataclass
+class ScoreResult:
+    """Detailed result for scoring one guidance candidate."""
+
+    rate: float
+    resolved: int
+    total: int
+    non_empty_patches: int
+    total_elapsed_s: float
+    token_usage: dict[str, int]
+    instance_metrics_path: str
+
+    def to_dict(self) -> dict:
+        return {
+            "rate": self.rate,
+            "resolved": self.resolved,
+            "total": self.total,
+            "non_empty_patches": self.non_empty_patches,
+            "non_empty_patch_rate": (self.non_empty_patches / self.total) if self.total else 0.0,
+            "total_elapsed_s": self.total_elapsed_s,
+            "mean_elapsed_s": (self.total_elapsed_s / self.total) if self.total else 0.0,
+            "token_usage": dict(self.token_usage),
+            "instance_metrics_path": self.instance_metrics_path,
+        }
 
 
 def score_candidate(
@@ -26,6 +56,31 @@ def score_candidate(
     preds_dir: Path | None = None,
     eval_fn: callable | None = None,
 ) -> float:
+    """Compatibility wrapper returning only resolve rate."""
+    detailed = score_candidate_detailed(
+        guidance=guidance,
+        tasks_file=tasks_file,
+        model=model,
+        n_tasks=n_tasks,
+        timeout_s=timeout_s,
+        step_limit=step_limit,
+        preds_dir=preds_dir,
+        eval_fn=eval_fn,
+    )
+    return detailed.rate
+
+
+def score_candidate_detailed(
+    guidance: RepoGuidance,
+    tasks_file: Path,
+    model: str,
+    *,
+    n_tasks: int = 20,
+    timeout_s: int = 600,
+    step_limit: int = 30,
+    preds_dir: Path | None = None,
+    eval_fn: callable | None = None,
+) -> ScoreResult:
     """Score a guidance candidate against SWE-smith tasks.
 
     Runs the Docker agent on *n_tasks* tasks from ``tasks_file``, each with
@@ -44,7 +99,7 @@ def score_candidate(
             Defaults to ``_default_eval`` which calls SWE-bench harness.
 
     Returns:
-        Resolve rate as a float in [0, 1].
+        Detailed scoring metrics including resolve rate.
     """
     instances = load_instances(
         dataset_name="",
@@ -64,17 +119,31 @@ def score_candidate(
         preds_dir = PREDS_DIR / "tuning" / tag
     preds_dir.mkdir(parents=True, exist_ok=True)
     preds_path = preds_dir / "preds.jsonl"
+    metrics_path = preds_dir / "instance_metrics.jsonl"
 
     # Resume support
     completed: dict[str, str] = {}
+    completed_metrics: dict[str, dict] = {}
     if preds_path.exists():
         for line in preds_path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 rec = json.loads(line)
                 completed[rec["instance_id"]] = rec.get("model_patch", "")
+    if metrics_path.exists():
+        for line in metrics_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                completed_metrics[rec["instance_id"]] = rec
 
     resolved = 0
     total = 0
+    non_empty_patches = 0
+    total_elapsed_s = 0.0
+    token_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
 
     for i, instance in enumerate(instances):
         iid = instance["instance_id"]
@@ -82,9 +151,16 @@ def score_candidate(
 
         if iid in completed:
             patch = completed[iid]
+            prev = completed_metrics.get(iid, {})
+            elapsed_s = float(prev.get("elapsed_s", 0.0))
+            usage = prev.get("token_usage", {}) if isinstance(prev, dict) else {}
+            prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+            total_tokens = int(usage.get("total_tokens", 0) or 0)
         else:
+            started = time.perf_counter()
             try:
-                patch = generate_patch_with_mini_swebench(
+                result = generate_patch_with_mini_swebench_result(
                     instance=instance,
                     model=model,
                     context_md=guidance_text or None,
@@ -92,9 +168,19 @@ def score_candidate(
                     step_limit=step_limit,
                     traj_dir=preds_dir / "trajectories",
                 )
+                patch = result.get("patch", "")
+                elapsed_s = float(result.get("elapsed_s", 0.0) or 0.0)
+                usage = result.get("token_usage", {}) if isinstance(result, dict) else {}
+                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+                total_tokens = int(usage.get("total_tokens", 0) or 0)
             except Exception as exc:
                 print(f"  [score] Error on {iid}: {exc}", file=sys.stderr)
                 patch = ""
+                elapsed_s = time.perf_counter() - started
+                prompt_tokens = 0
+                completion_tokens = 0
+                total_tokens = 0
 
             # Append to preds file
             record = {
@@ -105,11 +191,31 @@ def score_candidate(
             with preds_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
 
+            metrics_record = {
+                "instance_id": iid,
+                "elapsed_s": elapsed_s,
+                "patch_non_empty": bool(patch and patch.strip()),
+                "token_usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                },
+            }
+            with metrics_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(metrics_record, sort_keys=True, ensure_ascii=False) + "\n")
+
         # Evaluate
         if eval_fn is not None:
             passed = eval_fn(instance, patch)
         else:
             passed = _default_eval(instance, patch)
+
+        if patch and patch.strip():
+            non_empty_patches += 1
+        total_elapsed_s += elapsed_s
+        token_usage["prompt_tokens"] += prompt_tokens
+        token_usage["completion_tokens"] += completion_tokens
+        token_usage["total_tokens"] += total_tokens
 
         if passed:
             resolved += 1
@@ -118,14 +224,21 @@ def score_candidate(
 
     rate = resolved / total if total else 0.0
     print(f"  [score] {tag}: {resolved}/{total} = {rate:.1%}")
-    return rate
+    return ScoreResult(
+        rate=rate,
+        resolved=resolved,
+        total=total,
+        non_empty_patches=non_empty_patches,
+        total_elapsed_s=total_elapsed_s,
+        token_usage=token_usage,
+        instance_metrics_path=str(metrics_path),
+    )
 
 
 def _default_eval(instance: dict, patch: str) -> bool:
     """Default evaluator: run SWE-bench harness for a single instance.
 
-    Falls back to a simple heuristic (non-empty patch) if the harness
-    is not available, since full eval requires Docker + swebench installed.
+    Does not use heuristics: harness failures are counted as failures.
     """
     if not patch or not patch.strip():
         return False
@@ -135,10 +248,7 @@ def _default_eval(instance: dict, patch: str) -> bool:
         return _run_swebench_eval_single(instance, patch)
     except Exception as exc:
         print(f"  [eval] Harness failed for {instance['instance_id']}: {exc}")
-        # Fallback: count non-empty patch as a tentative pass.
-        # The tuning loop uses relative comparison, so consistent bias
-        # still lets the hill-climber find better guidance.
-        return True
+        return False
 
 
 def _run_swebench_eval_single(instance: dict, patch: str) -> bool:

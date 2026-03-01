@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from context_policy.loop.orchestrator import ExperimentConfig, run_experiment
+from context_policy.guidance.tuner import MAX_TUNING_ITERATIONS
 from context_policy.utils.run_id import make_run_id
 
 
@@ -45,7 +46,12 @@ def main() -> None:
     parser.add_argument("--experiment-id", default=None, help="Experiment run ID.")
 
     # Tuning hyperparams
-    parser.add_argument("--iterations", type=int, default=10, help="Hill-climbing iterations T.")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=10,
+        help=f"Hill-climbing iterations T (0..{MAX_TUNING_ITERATIONS}).",
+    )
     parser.add_argument("--candidates", type=int, default=6, help="Candidates per iteration K.")
     parser.add_argument("--tasks-per-score", type=int, default=20, help="Tasks per scoring run N.")
     parser.add_argument("--char-budget", type=int, default=3200, help="Guidance char budget.")
@@ -63,6 +69,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Skip LLM/agent calls.")
 
     args = parser.parse_args()
+
+    if args.iterations < 0 or args.iterations > MAX_TUNING_ITERATIONS:
+        parser.error(f"--iterations must be between 0 and {MAX_TUNING_ITERATIONS}.")
 
     # Load repo config
     repo_config_path = Path(args.repo_config)

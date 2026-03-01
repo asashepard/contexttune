@@ -38,6 +38,31 @@ REPOS = [
 ]
 
 
+def _normalize_repo_slug(value: str | None) -> str:
+    """Normalize repo slugs to canonical owner/name lowercase format."""
+    if not value:
+        return ""
+    v = str(value).strip().lower()
+    # SWE-smith/HF may encode repos as owner__name
+    v = v.replace("__", "/")
+    # Collapse accidental duplicate slashes
+    while "//" in v:
+        v = v.replace("//", "/")
+    return v
+
+
+def _repo_from_instance_id(instance_id: str | None) -> str:
+    """Best-effort derive repo slug from SWE-style instance_id."""
+    if not instance_id:
+        return ""
+    iid = str(instance_id)
+    # Common format: owner__repo-12345
+    head = iid.split("-", 1)[0]
+    if "__" in head:
+        return _normalize_repo_slug(head)
+    return ""
+
+
 def generate_tasks_swesmith(
     repo: str,
     commit: str,
@@ -74,23 +99,37 @@ def generate_tasks_swesmith(
 def _row_to_task(row: dict, repo: str, default_commit: str) -> dict | None:
     """Normalize a SWE-smith row into our task contract."""
     instance_id = row.get("instance_id") or row.get("id")
-    row_repo = row.get("repo") or row.get("repository")
-    base_commit = row.get("base_commit") or row.get("commit") or default_commit
+    row_repo = (
+        row.get("repo")
+        or row.get("repository")
+        or row.get("repo_name")
+        or row.get("repo_slug")
+        or _repo_from_instance_id(instance_id)
+    )
+    base_commit = (
+        row.get("base_commit")
+        or row.get("commit")
+        or row.get("base_sha")
+        or row.get("environment_setup_commit")
+        or default_commit
+    )
     problem_statement = (
         row.get("problem_statement")
         or row.get("issue")
         or row.get("problem")
         or row.get("prompt")
+        or row.get("issue_text")
+        or row.get("text")
         or ""
     )
     if not instance_id or not row_repo or not base_commit:
         return None
-    if str(row_repo) != repo:
+    if _normalize_repo_slug(str(row_repo)) != _normalize_repo_slug(repo):
         return None
 
     return {
         "instance_id": str(instance_id),
-        "repo": str(row_repo),
+        "repo": _normalize_repo_slug(str(row_repo)),
         "base_commit": str(base_commit),
         "problem_statement": str(problem_statement),
         "source": "swe_smith_hf",
@@ -111,14 +150,31 @@ def generate_tasks_from_hf(repo: str, commit: str, n: int, output_path: Path) ->
 
     ds = load_dataset("SWE-bench/SWE-smith", split="train")
     rows = []
+    seen_repos: dict[str, int] = {}
     for row in ds:
-        task = _row_to_task(dict(row), repo=repo, default_commit=commit)
+        rowd = dict(row)
+        observed_repo = (
+            rowd.get("repo")
+            or rowd.get("repository")
+            or rowd.get("repo_name")
+            or rowd.get("repo_slug")
+            or _repo_from_instance_id(rowd.get("instance_id") or rowd.get("id"))
+        )
+        normalized_observed = _normalize_repo_slug(observed_repo)
+        if normalized_observed:
+            seen_repos[normalized_observed] = seen_repos.get(normalized_observed, 0) + 1
+
+        task = _row_to_task(rowd, repo=repo, default_commit=commit)
         if task is not None:
             rows.append(task)
 
     if not rows:
+        target = _normalize_repo_slug(repo)
+        sample_repos = sorted(seen_repos.items(), key=lambda kv: kv[1], reverse=True)[:15]
+        sample_text = ", ".join(f"{k}({v})" for k, v in sample_repos) if sample_repos else "<none>"
         raise RuntimeError(
-            f"No SWE-smith HF rows found for repo={repo}."
+            f"No SWE-smith HF rows found for repo={repo} (normalized={target}). "
+            f"Observed repo values include: {sample_text}"
         )
 
     # Prefer matching commit when caller specified one; otherwise keep repo-wide set.

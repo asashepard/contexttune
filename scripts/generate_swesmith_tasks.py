@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -46,10 +47,12 @@ def generate_tasks_swesmith(
     """Generate tasks using the swesmith library."""
     try:
         from swesmith.bug_gen import generate_bugs  # type: ignore
-    except ImportError:
-        raise ImportError(
-            "swesmith is not installed. Install with: pip install swesmith"
+    except Exception as exc:
+        print(
+            "  [swesmith] generate_bugs API unavailable "
+            f"({type(exc).__name__}: {exc}). Falling back to HF dataset..."
         )
+        return generate_tasks_from_hf(repo, commit, n, output_path)
 
     bugs = generate_bugs(repo=repo, commit=commit, n=n)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +69,76 @@ def generate_tasks_swesmith(
             f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
 
     return len(bugs)
+
+
+def _row_to_task(row: dict, repo: str, default_commit: str) -> dict | None:
+    """Normalize a SWE-smith row into our task contract."""
+    instance_id = row.get("instance_id") or row.get("id")
+    row_repo = row.get("repo") or row.get("repository")
+    base_commit = row.get("base_commit") or row.get("commit") or default_commit
+    problem_statement = (
+        row.get("problem_statement")
+        or row.get("issue")
+        or row.get("problem")
+        or row.get("prompt")
+        or ""
+    )
+    if not instance_id or not row_repo or not base_commit:
+        return None
+    if str(row_repo) != repo:
+        return None
+
+    return {
+        "instance_id": str(instance_id),
+        "repo": str(row_repo),
+        "base_commit": str(base_commit),
+        "problem_statement": str(problem_statement),
+        "source": "swe_smith_hf",
+    }
+
+
+def generate_tasks_from_hf(repo: str, commit: str, n: int, output_path: Path) -> int:
+    """Fallback task generator using HF SWE-smith dataset.
+
+    This path is used when local swesmith generation APIs are unavailable.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "datasets is required for SWE-smith HF fallback. Install with: pip install datasets"
+        ) from exc
+
+    ds = load_dataset("SWE-bench/SWE-smith", split="train")
+    rows = []
+    for row in ds:
+        task = _row_to_task(dict(row), repo=repo, default_commit=commit)
+        if task is not None:
+            rows.append(task)
+
+    if not rows:
+        raise RuntimeError(
+            f"No SWE-smith HF rows found for repo={repo}."
+        )
+
+    # Prefer matching commit when caller specified one; otherwise keep repo-wide set.
+    if commit != "HEAD":
+        commit_rows = [r for r in rows if r.get("base_commit") == commit]
+        if commit_rows:
+            rows = commit_rows
+
+    # Stable pseudo-random sample for reproducibility across runs.
+    seed = abs(hash(f"{repo}:{commit}")) % (2 ** 32)
+    rng = random.Random(seed)
+    rng.shuffle(rows)
+    rows = rows[:n]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        for task in rows:
+            f.write(json.dumps(task, sort_keys=True, ensure_ascii=False) + "\n")
+
+    return len(rows)
 
 
 def generate_tasks_fallback(

@@ -56,20 +56,25 @@ bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline,tun
 
 Default IDs file: `scripts/easy_4_ids.txt`.
 
-## Adaptive SWE-Smith Context Loop (v1)
+## Tree-Sitter Probe + Oracle Tuning
 
-Normalize SWE-Smith tasks into local contract:
+Build a knowledge base and tune AGENTS.md for a single repo:
 
 ```bash
-python scripts/import_swesmith_tasks.py --source /path/to/swesmith_tasks.jsonl --out artifacts/tasks/swesmith_norm.jsonl
+python scripts/tune_single_repo.py \
+  --repo django/django \
+  --commit HEAD \
+  --model openai/gpt-5.2 \
+  --output-dir results/exp1/guidance/django__django \
+  --iterations 5
 ```
 
-Run adaptive rounds (generate/eval/update policy each round):
+Run a full experiment across all repos with three conditions:
 
 ```bash
-python scripts/run_adaptive_context_loop.py \
-	--model openai/gpt-5.2 \
-	--tasks_file artifacts/tasks/swesmith_norm.jsonl \
-	--rounds 2 \
-	--conditions baseline,tuned
+python scripts/run_experiment.py \
+  --model openai/gpt-5.2 \
+  --repo-config artifacts/configs/repos_12.json \
+  --conditions no_context static_kb oracle_tuned \
+  --oracle-iterations 5
 ```

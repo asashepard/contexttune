@@ -5,18 +5,20 @@ Usage (dev smoke test):
     python scripts/run_experiment.py \\
         --model openai/my-model \\
         --repo-config repos.json \\
-        --iterations 3 --candidates 4 --tasks-per-score 10 \\
+        --conditions no_context static_kb oracle_tuned \\
+        --oracle-iterations 3 \\
         --dry-run
 
 Usage (full run):
     python scripts/run_experiment.py \\
         --model openai/my-model \\
         --repo-config repos.json \\
-        --iterations 10 --candidates 6 --tasks-per-score 20
+        --conditions no_context static_kb oracle_tuned \\
+        --oracle-iterations 5
 
 The repo-config JSON file has the structure:
 [
-  {"repo": "django/django", "commit": "<sha>", "tasks_file": "artifacts/tasks/django__django/train.jsonl"},
+  {"repo": "django/django", "commit": "<sha>"},
   ...
 ]
 """
@@ -29,8 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from context_policy.loop.orchestrator import ExperimentConfig, run_experiment
-from context_policy.guidance.tuner import MAX_TUNING_ITERATIONS
+from context_policy.loop.orchestrator import ExperimentConfig, VALID_CONDITIONS, run_experiment
 from context_policy.utils.run_id import make_run_id
 
 
@@ -41,20 +42,26 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="Model name (e.g. openai/my-model).")
     parser.add_argument(
         "--repo-config", required=True,
-        help="JSON file listing repos with commit + tasks_file.",
+        help="JSON file listing repos with commit.",
     )
     parser.add_argument("--experiment-id", default=None, help="Experiment run ID.")
 
-    # Tuning hyperparams
+    # Conditions
     parser.add_argument(
-        "--iterations",
-        type=int,
-        default=10,
-        help=f"Hill-climbing iterations T (0..{MAX_TUNING_ITERATIONS}).",
+        "--conditions",
+        nargs="+",
+        default=list(VALID_CONDITIONS),
+        choices=VALID_CONDITIONS,
+        help="Experimental conditions to evaluate.",
     )
-    parser.add_argument("--candidates", type=int, default=6, help="Candidates per iteration K.")
-    parser.add_argument("--tasks-per-score", type=int, default=20, help="Tasks per scoring run N.")
-    parser.add_argument("--char-budget", type=int, default=3200, help="Guidance char budget.")
+
+    # Oracle tuning hyperparams
+    parser.add_argument(
+        "--oracle-iterations",
+        type=int,
+        default=5,
+        help="Oracle loop iterations (0 = static KB only).",
+    )
 
     # Runner settings
     parser.add_argument("--timeout-s", type=int, default=600, help="Per-task agent timeout.")
@@ -70,9 +77,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.iterations < 0 or args.iterations > MAX_TUNING_ITERATIONS:
-        parser.error(f"--iterations must be between 0 and {MAX_TUNING_ITERATIONS}.")
-
     # Load repo config
     repo_config_path = Path(args.repo_config)
     if not repo_config_path.exists():
@@ -85,10 +89,8 @@ def main() -> None:
         experiment_id=experiment_id,
         model=args.model,
         repos=repos,
-        iterations=args.iterations,
-        candidates_per_iter=args.candidates,
-        tasks_per_score=args.tasks_per_score,
-        char_budget=args.char_budget,
+        conditions=list(args.conditions),
+        oracle_iterations=args.oracle_iterations,
         timeout_s=args.timeout_s,
         step_limit=args.step_limit,
         eval_dataset=args.eval_dataset,
@@ -100,7 +102,8 @@ def main() -> None:
     print(f"Experiment: {experiment_id}")
     print(f"Model: {args.model}")
     print(f"Repos: {len(repos)}")
-    print(f"Tuning: T={args.iterations}, K={args.candidates}, N={args.tasks_per_score}")
+    print(f"Conditions: {args.conditions}")
+    print(f"Oracle iterations: {args.oracle_iterations}")
     print(f"Dry run: {args.dry_run}")
     print()
 

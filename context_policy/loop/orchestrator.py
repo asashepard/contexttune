@@ -1,10 +1,11 @@
 """Per-repo guidance tuning orchestrator.
 
-Replaces the old adaptive-loop orchestrator with a design that:
-1. Tunes guidance independently for each of the 12 repos using SWE-smith.
-2. Evaluates on SWE-bench Verified under two conditions:
-   - ``no_context``: agent sees only the issue + tree.
-   - ``tuned_context``: agent sees the issue + tree + tuned guidance.
+Supports three experimental conditions:
+1. ``no_context``: agent sees only the issue + tree (baseline).
+2. ``static_kb``: agent sees tree-sitter KB rendered as AGENTS.md (no LLM tuning).
+3. ``oracle_tuned``: agent sees AGENTS.md refined by the LLM-as-judge oracle loop.
+
+Evaluation on SWE-bench Verified is unchanged.
 """
 from __future__ import annotations
 
@@ -16,11 +17,16 @@ from pathlib import Path
 
 from context_policy.datasets.swebench import load_instances, read_instance_ids
 from context_policy.guidance.schema import RepoGuidance
-from context_policy.guidance.tuner import TuningConfig, run_tuning_loop
+from context_policy.oracle.loop import run_oracle_loop
+from context_policy.oracle.schema import OracleConfig
 from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench_result
 from context_policy.utils.jsonl import read_jsonl
 from context_policy.utils.paths import PREDS_DIR, PROJECT_ROOT, RESULTS_DIR
 from context_policy.utils.subproc import run as subproc_run
+
+
+# Valid experimental conditions
+VALID_CONDITIONS = ("no_context", "static_kb", "oracle_tuned")
 
 
 # ── data classes ───────────────────────────────────────────────
@@ -32,13 +38,13 @@ class ExperimentConfig:
 
     experiment_id: str
     model: str
-    repos: list[dict]  # each: {"repo": str, "commit": str, "tasks_file": str}
+    repos: list[dict]  # each: {"repo": str, "commit": str}
 
-    # Tuning hyperparams
-    iterations: int = 10
-    candidates_per_iter: int = 6
-    tasks_per_score: int = 20
-    char_budget: int = 3200
+    # Conditions to evaluate
+    conditions: list[str] = field(default_factory=lambda: list(VALID_CONDITIONS))
+
+    # Oracle tuning hyperparams
+    oracle_iterations: int = 5
 
     # Runner settings
     timeout_s: int = 600
@@ -49,6 +55,13 @@ class ExperimentConfig:
     eval_split: str = "test"
     eval_instance_ids_file: str | None = None
     max_workers_eval: int = 4
+
+    def __post_init__(self) -> None:
+        for c in self.conditions:
+            if c not in VALID_CONDITIONS:
+                raise ValueError(
+                    f"Unknown condition '{c}'. Valid: {VALID_CONDITIONS}"
+                )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -79,8 +92,8 @@ class ExperimentState:
 def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
     """Run the full tuning + evaluation experiment.
 
-    Phase 1: For each repo, run the hill-climbing tuning loop.
-    Phase 2: Evaluate on SWE-bench Verified (no_context vs tuned_context).
+    Phase 1: For each repo, build KB and run oracle loop (if conditions require).
+    Phase 2: Evaluate on SWE-bench Verified under selected conditions.
 
     Args:
         config: Experiment configuration.
@@ -106,49 +119,73 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
     config_path = exp_root / "experiment_config.json"
     config_path.write_text(json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8")
 
-    # ── Phase 1: Tuning ────────────────────────────────────────
-    guidance_map: dict[str, RepoGuidance] = {}  # repo -> best guidance
+    # ── Phase 1: Build KB + Oracle tuning ──────────────────────
+    # Determine which repos need oracle tuning
+    needs_kb = "static_kb" in config.conditions or "oracle_tuned" in config.conditions
+    needs_oracle = "oracle_tuned" in config.conditions
+
+    guidance_map: dict[str, dict[str, RepoGuidance]] = {}
+    #  guidance_map[repo][condition] = RepoGuidance
 
     for repo_info in config.repos:
         repo = repo_info["repo"]
         commit = repo_info["commit"]
-        tasks_file = repo_info["tasks_file"]
+
+        guidance_map.setdefault(repo, {})
+
+        if not needs_kb:
+            if repo in state.tuning_completed:
+                print(f"[experiment] Skipping KB for {repo} (no KB conditions)")
+            continue
 
         if repo in state.tuning_completed:
-            # Load previously tuned guidance
-            g_path = exp_root / "guidance" / repo.replace("/", "__") / "best_guidance.json"
-            if g_path.exists():
-                guidance_map[repo] = RepoGuidance.load(g_path)
-                print(f"[experiment] Skipping tuning for {repo} (already done)")
-                continue
+            # Load previously computed artifacts
+            g_dir = exp_root / "guidance" / repo.replace("/", "__")
+            static_path = g_dir / "versions" / "v0.json"
+            best_path = g_dir / "best_guidance.json"
+
+            if static_path.exists():
+                guidance_map[repo]["static_kb"] = RepoGuidance.load(static_path)
+            if best_path.exists():
+                guidance_map[repo]["oracle_tuned"] = RepoGuidance.load(best_path)
+            print(f"[experiment] Skipping {repo} (already done)")
+            continue
 
         print(f"\n{'='*60}")
-        print(f"[experiment] Tuning guidance for {repo}")
+        print(f"[experiment] Processing {repo}")
         print(f"{'='*60}")
 
-        tc = TuningConfig(
-            repo=repo,
-            commit=commit,
-            tasks_file=tasks_file,
-            model=config.model,
-            iterations=config.iterations,
-            candidates_per_iter=config.candidates_per_iter,
-            tasks_per_score=config.tasks_per_score,
-            char_budget=config.char_budget,
-            timeout_s=config.timeout_s,
-            step_limit=config.step_limit,
-            output_dir=str(exp_root / "guidance" / repo.replace("/", "__")),
-        )
+        oracle_iters = config.oracle_iterations if needs_oracle else 0
+        out_dir = str(exp_root / "guidance" / repo.replace("/", "__"))
 
         if dry_run:
             g = RepoGuidance(repo=repo, commit=commit, lines=["- (dry run)"], version=0)
-            g_out = Path(tc.output_dir)
+            g_out = Path(out_dir)
             g_out.mkdir(parents=True, exist_ok=True)
             g.save(g_out / "best_guidance.json")
-            guidance_map[repo] = g
+            (g_out / "versions").mkdir(parents=True, exist_ok=True)
+            g.save(g_out / "versions" / "v0.json")
+            guidance_map[repo]["static_kb"] = g
+            guidance_map[repo]["oracle_tuned"] = g
         else:
-            best = run_tuning_loop(tc)
-            guidance_map[repo] = best
+            oc = OracleConfig(
+                repo=repo,
+                commit=commit,
+                model=config.model,
+                iterations=oracle_iters,
+                timeout_s=config.timeout_s,
+                output_dir=out_dir,
+            )
+            kb, best = run_oracle_loop(oc)
+
+            # v0 is always the static_kb version
+            v0_path = Path(out_dir) / "versions" / "v0.json"
+            if v0_path.exists():
+                guidance_map[repo]["static_kb"] = RepoGuidance.load(v0_path)
+            else:
+                guidance_map[repo]["static_kb"] = best
+
+            guidance_map[repo]["oracle_tuned"] = best
 
         state.tuning_completed.append(repo)
         state.save(state_path)
@@ -174,10 +211,9 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
     for inst in eval_instances:
         instances_by_repo.setdefault(inst["repo"], []).append(inst)
 
-    conditions = ["no_context", "tuned_context"]
     eval_results: dict[str, dict] = {}
 
-    for condition in conditions:
+    for condition in config.conditions:
         cond_preds_path = PREDS_DIR / config.experiment_id / condition / "preds.jsonl"
         cond_preds_path.parent.mkdir(parents=True, exist_ok=True)
         cond_metrics_path = exp_root / "metrics" / f"{condition}_instances.jsonl"
@@ -210,8 +246,10 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
                 continue
 
             guidance_text = None
-            if condition == "tuned_context" and repo in guidance_map:
-                guidance_text = guidance_map[repo].render()
+            if condition in ("static_kb", "oracle_tuned"):
+                repo_guidance = guidance_map.get(repo, {}).get(condition)
+                if repo_guidance is not None:
+                    guidance_text = repo_guidance.render()
 
             for i, instance in enumerate(instances):
                 iid = instance["instance_id"]
@@ -357,22 +395,36 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
         "experiment_id": config.experiment_id,
         "model": config.model,
         "repos": [r["repo"] for r in config.repos],
-        "tuning_config": {
-            "iterations": config.iterations,
-            "candidates_per_iter": config.candidates_per_iter,
-            "tasks_per_score": config.tasks_per_score,
-        },
+        "conditions": config.conditions,
+        "oracle_iterations": config.oracle_iterations,
         "eval_results": eval_results,
     }
 
+    # Compute deltas between conditions
     nc = eval_results.get("no_context", {})
-    tc = eval_results.get("tuned_context", {})
-    if "rate" in nc and "rate" in tc:
-        summary["delta"] = {
-            "absolute": tc["rate"] - nc["rate"],
+    sk = eval_results.get("static_kb", {})
+    ot = eval_results.get("oracle_tuned", {})
+    deltas: dict[str, dict] = {}
+    if "rate" in nc and "rate" in sk:
+        deltas["static_kb_vs_no_context"] = {
+            "absolute": sk["rate"] - nc["rate"],
             "no_context_rate": nc["rate"],
-            "tuned_context_rate": tc["rate"],
+            "static_kb_rate": sk["rate"],
         }
+    if "rate" in nc and "rate" in ot:
+        deltas["oracle_tuned_vs_no_context"] = {
+            "absolute": ot["rate"] - nc["rate"],
+            "no_context_rate": nc["rate"],
+            "oracle_tuned_rate": ot["rate"],
+        }
+    if "rate" in sk and "rate" in ot:
+        deltas["oracle_tuned_vs_static_kb"] = {
+            "absolute": ot["rate"] - sk["rate"],
+            "static_kb_rate": sk["rate"],
+            "oracle_tuned_rate": ot["rate"],
+        }
+    if deltas:
+        summary["deltas"] = deltas
 
     summary_path = exp_root / "experiment_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

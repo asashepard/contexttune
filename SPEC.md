@@ -12,16 +12,17 @@
 
 ```
 artifacts/preds/<experiment_id>/<condition>/preds.jsonl
-artifacts/tasks/<repo_dirname>/train.jsonl
-artifacts/tasks/<repo_dirname>/holdout.jsonl
-artifacts/guidance/<repo_dirname>/best_guidance.json
+artifacts/guidance/<repo_dirname>/kb/kb.json
+artifacts/guidance/<repo_dirname>/kb/agents_md_v0.md
+artifacts/guidance/<repo_dirname>/kb/probes_summary.json
 artifacts/guidance/<repo_dirname>/versions/v0.json ... vN.json
+artifacts/guidance/<repo_dirname>/best_guidance.json
 artifacts/guidance/<repo_dirname>/tuning_state.json
 results/<experiment_id>/
   ├── experiment_config.json
   ├── experiment_state.json
   ├── experiment_summary.json
-  ├── guidance/<repo_dirname>/best_guidance.json
+  ├── guidance/<repo_dirname>/...
   └── logs/
 ```
 
@@ -62,23 +63,60 @@ class RepoGuidance:
 This block is prepended to the problem statement for agent-based runners,
 or appended to the user message for single-shot prompting.
 
-## Hill-Climbing Tuner
+## Tree-Sitter Probe Layer
 
-1. **Init G₀**: LLM generates initial guidance from repo tree + conventions.
-2. **Score G₀**: Run N SWE-smith tasks through Docker agent, measure resolve rate.
-3. **Iterate T times**:
-   - Propose K candidate edits via LLM.
-   - Score each candidate on N tasks.
-   - If any candidate beats current best, adopt it.
-4. **Save best guidance** for final evaluation.
+Static analysis of the repo using **py-tree-sitter** (Python only):
 
-### Default Budget (Final)
+1. **Import graph**: Build `importedBy` map, identify hub modules (≤12).
+2. **Symbol index**: Extract functions, classes, constants with signatures + callers (≤10/file, ≤30 files).
+3. **Entry points**: Content-based detection (if-main, decorators, CLI, ASGI/WSGI, ≤10).
+4. **Clustering**: Co-import scoring (shared importers ≥2), greedy agglomeration (≤6 clusters, ≤8 chains).
+5. **Conventions**: Docstring style, type hints, import patterns, linter configs.
+6. **Tests**: Test directories, conftest, pytest config.
 
-| Parameter | Dev | Final |
-|-----------|-----|-------|
-| T (iterations) | 3 | 10 |
-| K (candidates) | 4 | 6 |
-| N (tasks/score) | 10 | 20 |
+Probe results are deterministic (no LLM calls).
+
+## Knowledge Base (KB)
+
+Built from probe results as a structured markdown document with sections:
+
+| Section | Line Budget |
+|---------|-------------|
+| Architecture (hubs + entry points) | 200 |
+| Symbol Map | 300 |
+| Context (clusters + tests) | 200 |
+| Conventions | unbounded (small) |
+
+KB is saved as JSON (`kb.json`) and rendered into an AGENTS.md file.
+
+## AGENTS.md
+
+A ≤3,200 character instruction document rendered deterministically from the KB.
+This is the `static_kb` experimental condition.
+
+## Oracle Evaluator Loop (LLM-as-Judge)
+
+Replaces the old SWE-Smith hill-climbing tuner.
+
+1. **Build KB**: Checkout repo → run probes → build KB (deterministic).
+2. **Render static AGENTS.md** from KB (`static_kb` condition).
+3. **Generate micro-test probes** from KB (5 categories, ≤10 total):
+   - hub-safety, entry-point, naming, architecture, harvested
+4. **For T iterations** (default 5):
+   a. **Simulate**: Send AGENTS.md as system prompt + probe task → AI response.
+   b. **Judge**: LLM evaluates response against expected behaviors → PASS/FAIL.
+   c. **Diagnose**: Collect failures → LLM proposes structured edits.
+   d. **Apply**: LLM merges edits into AGENTS.md (re-enforce 3,200-char budget).
+   e. If new version improves pass rate, adopt it.
+5. **Save best AGENTS.md** → `oracle_tuned` condition.
+
+### Experimental Conditions
+
+| Condition | Agent sees | Tuning |
+|-----------|-----------|--------|
+| `no_context` | Issue + tree only | None |
+| `static_kb` | Issue + tree + KB-derived AGENTS.md | None (deterministic) |
+| `oracle_tuned` | Issue + tree + oracle-refined AGENTS.md | LLM-as-judge loop |
 
 ### 12 Experiment Repos
 
@@ -137,10 +175,8 @@ export OPENAI_API_KEY="sk-..."
 | Script | Purpose |
 |--------|---------|
 | `scripts/run_experiment.py` | Full experiment: tune all repos + Verified eval |
-| `scripts/tune_single_repo.py` | Tune one repo (for array jobs) |
+| `scripts/tune_single_repo.py` | Tune one repo via oracle loop (for array jobs) |
 | `scripts/run_inference.py` | Standalone inference (any runner) |
-| `scripts/generate_swesmith_tasks.py` | Generate SWE-smith tasks for one repo |
-| `scripts/generate_all_swesmith.sh` | Generate tasks for all 12 repos |
 | `scripts/run_swebench_eval.sh` | Run SWE-bench harness evaluation |
 | `scripts/build_docker_images.py` | Build Docker images for SWE-bench instances |
 
@@ -155,14 +191,15 @@ export OPENAI_API_KEY="sk-..."
 ## Experiment Workflow
 
 ```
-1. Generate SWE-smith tasks:
-   bash scripts/generate_all_swesmith.sh commit_map.txt
+1. Configure repos (repos.json with repo + commit):
+   [{"repo": "django/django", "commit": "<sha>"}, ...]
 
 2a. Sequential (single node):
-    python scripts/run_experiment.py --model <model> --repo-config repos.json
+    python scripts/run_experiment.py --model <model> --repo-config repos.json \
+        --conditions no_context static_kb oracle_tuned --oracle-iterations 5
 
 2b. Parallel (Slurm):
-    sbatch --array=0-11 slurm/tune_array.sh   # tune 12 repos
+    sbatch --array=0-11 slurm/tune_array.sh   # oracle tune 12 repos
     sbatch slurm/eval_verified.sh               # eval after tuning
 
 3. Results:

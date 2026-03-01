@@ -12,7 +12,7 @@
 ## Install Dependencies
 
 ```bash
-pip install swebench
+pip install -r requirements.txt
 ```
 
 ## Run Sanity Check
@@ -37,21 +37,20 @@ pip install swebench
 For cluster runs on GPMoo, use the runbook and Slurm templates:
 
 - Runbook: `docs/GPMOO_RUNBOOK.md`
-- Slurm scripts: `slurm/run_preflight.sh`, `slurm/run_smoke.sh`, `slurm/run_mini_condition.sh`, `slurm/run_eval_condition.sh`, `slurm/run_full_condition_array.sh`, `slurm/run_full_eval_array.sh`
-- Submission/sharding helpers: `scripts/split_instance_ids.py`, `scripts/submit_full_verified_array.sh`
+- Slurm scripts: `slurm/smoke_experiment.sh`, `slurm/tune_array.sh`, `slurm/eval_verified.sh`
 
-## One-Command 4-Instance Run + Eval
+## EC2 4-Instance Smoke Run + Eval
 
 Run a standardized 4-instance sanity pack on EC2 or gpmoo shell:
 
 ```bash
-bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2
+bash scripts/ec2_smoke.sh --model openai/gpt-5.2
 ```
 
-Use both conditions in one command:
+Run all three conditions in one command:
 
 ```bash
-bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline,tuned
+bash scripts/ec2_smoke.sh --model openai/gpt-5.2 --conditions no_context,static_kb,oracle_tuned
 ```
 
 Default IDs file: `scripts/easy_4_ids.txt`.

@@ -12,7 +12,7 @@
 # budget to verify everything works end-to-end.
 #
 # Submit:
-#   MODEL_NAME=openai/gpt-4o bash slurm/smoke_experiment.sh
+#   MODEL_NAME=openai/gpt-4o sbatch slurm/smoke_experiment.sh
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -31,19 +31,9 @@ mkdir -p "$SMOKE_DIR"
 
 cat > "$SMOKE_DIR/repos.json" << 'EOF'
 [
-  {"repo": "psf/requests", "commit": "HEAD", "tasks_file": "artifacts/tasks/psf__requests/train.jsonl"}
+    {"repo": "psf/requests", "commit": "HEAD"}
 ]
 EOF
-
-# Generate tasks if not present
-if [[ ! -f "artifacts/tasks/psf__requests/train.jsonl" ]]; then
-    echo "Generating fallback tasks..."
-    python scripts/generate_swesmith_tasks.py \
-        --repo psf/requests --commit HEAD \
-        --n-train 10 --n-holdout 5 \
-        --output-dir artifacts/tasks/psf__requests \
-        --fallback
-fi
 
 DRY_FLAG=""
 if [[ -n "$DRY_RUN" ]]; then
@@ -53,9 +43,8 @@ fi
 python scripts/run_experiment.py \
     --model "$MODEL_NAME" \
     --repo-config "$SMOKE_DIR/repos.json" \
-    --iterations 2 \
-    --candidates 2 \
-    --tasks-per-score 5 \
+    --conditions no_context static_kb oracle_tuned \
+    --oracle-iterations 1 \
     --timeout-s 300 \
     --step-limit 15 \
     $DRY_FLAG

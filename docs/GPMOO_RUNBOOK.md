@@ -69,40 +69,41 @@ tail -f slurm-<jobid>.out
 
 Run this exact order:
 
-1. Preflight checks (short job)
-2. Smoke run on 3 IDs
-3. Mini condition jobs (`baseline` and `tuned`)
-4. Eval jobs for each condition
-5. Summarize and compare
+1. Smoke experiment (single repo, minimal budget)
+2. Tune all repos with Slurm array
+3. Run Verified eval over selected conditions
+4. Summarize and compare
 
-### 5.1 Preflight
+### 5.1 Smoke Experiment
 
 ```bash
-sbatch slurm/run_preflight.sh
+MODEL_NAME="openai/<model>" sbatch slurm/smoke_experiment.sh
 ```
 
-### 5.2 Smoke Run (3 IDs)
+### 5.2 Tune All Repos (Array)
 
 ```bash
-sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_TAG="gpmoo_smoke" slurm/run_smoke.sh
+MODEL_NAME="openai/<model>" EXP_ID="gpmoo_exp_001" \
+  sbatch --array=0-11 slurm/tune_array.sh
 ```
 
-### 5.3 Mini Condition Jobs
-
-Submit one job per condition:
+### 5.3 Verified Evaluation
 
 ```bash
-sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_ID="verified_mini_gpmoo_001",CONDITION="baseline" slurm/run_mini_condition.sh
-sbatch --export=ALL,MODEL_NAME="openai/<model>",RUN_ID="verified_mini_gpmoo_001",CONDITION="tuned" slurm/run_mini_condition.sh
+MODEL_NAME="openai/<model>" EXP_ID="gpmoo_exp_001" \
+  sbatch slurm/eval_verified.sh
 ```
 
-### 5.4 Eval Jobs
-
-Submit one eval per condition after inference files exist:
+To restrict to specific conditions or instance IDs, run directly:
 
 ```bash
-sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="baseline",DATASET_NAME="princeton-nlp/SWE-bench_Verified" slurm/run_eval_condition.sh
-sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="tuned",DATASET_NAME="princeton-nlp/SWE-bench_Verified" slurm/run_eval_condition.sh
+python scripts/run_experiment.py \
+  --model openai/<model> \
+  --repo-config artifacts/configs/repos_12.json \
+  --experiment-id gpmoo_exp_001 \
+  --conditions no_context static_kb oracle_tuned \
+  --oracle-iterations 5 \
+  --eval-instance-ids scripts/verified_mini_ids.txt
 ```
 
 ## 5.5 One-Command 4-Instance Sanity Run
@@ -110,13 +111,13 @@ sbatch --export=ALL,RUN_ID="verified_mini_gpmoo_001",CONDITION="tuned",DATASET_N
 For a quick, reusable run+eval command (EC2 or gpmoo shell):
 
 ```bash
-bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2
+bash scripts/ec2_smoke.sh --model openai/gpt-5.2
 ```
 
 To run both conditions:
 
 ```bash
-bash scripts/run_smoke4_eval.sh --model openai/gpt-5.2 --conditions baseline,tuned
+bash scripts/ec2_smoke.sh --model openai/gpt-5.2 --conditions no_context,static_kb,oracle_tuned
 ```
 
 IDs are read from `scripts/easy_4_ids.txt` by default.
@@ -138,37 +139,18 @@ IDs are read from `scripts/easy_4_ids.txt` by default.
 
 ## 8) Full Verified Scaling
 
-- Split instance IDs into shards (see `scripts/split_instance_ids.py`).
-- Submit one array per condition for inference, with eval arrays chained by dependency.
+- Use `scripts/run_experiment.py` with a full instance ID list and all conditions.
 - Keep model, timeout, runner, and step limits identical across conditions.
+- Prefer one shared `EXP_ID` so tuning/eval artifacts stay in one results folder.
 
-### 8.1 Build Shards
-
-```bash
-python scripts/split_instance_ids.py \
-  --input_file scripts/verified_mini_ids.txt \
-  --shards 4 \
-  --out_dir artifacts/shards/verified_mini \
-  --prefix verified_mini
-```
-
-For full Verified, provide your full instance ID list file instead of `scripts/verified_mini_ids.txt`.
-
-### 8.2 Submit Full Array Jobs (End-to-End)
+Example full run:
 
 ```bash
-export MODEL_NAME="openai/<model>"
-export RUN_ID="verified_full_gpmoo_001"
-export SHARD_DIR="artifacts/shards/verified_mini"
-
-bash scripts/submit_full_verified_array.sh
+python scripts/run_experiment.py \
+  --model openai/<model> \
+  --repo-config artifacts/configs/repos_12.json \
+  --experiment-id verified_full_gpmoo_001 \
+  --conditions no_context static_kb oracle_tuned \
+  --oracle-iterations 5 \
+  --eval-instance-ids /path/to/full_verified_ids.txt
 ```
-
-This submits:
-
-- Inference array: `slurm/run_full_condition_array.sh` (for each condition)
-- Eval array: `slurm/run_full_eval_array.sh` with `afterok` dependency on inference
-
-Job IDs are recorded at:
-
-- `results/<RUN_ID>/slurm_jobs.tsv`

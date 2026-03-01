@@ -392,10 +392,42 @@ def _run_agent_in_docker(
         result_label, result_detail = agent.run(task)
         print(f"  Agent finished: label={result_label!r}, detail_len={len(result_detail)}")
 
+        try:
+            raw_detail_path = Path(traj_path).with_suffix(".raw_result_detail.txt")
+            raw_detail_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_detail_path.write_text(result_detail or "", encoding="utf-8")
+        except Exception as exc:
+            print(f"  WARNING: failed to write raw result detail: {exc}")
+
         # ---- Extract diff IMMEDIATELY, before env/container is destroyed ----
         # Re-check container ID (should be same, but just in case)
         current_cid = _get_running_container_id() or container_id
         print(f"  Container ID post-run: {current_cid}")
+
+        try:
+            container_git_path = Path(traj_path).with_suffix(".container_git.txt")
+            container_git_path.parent.mkdir(parents=True, exist_ok=True)
+            if current_cid:
+                debug_cmd = [
+                    "docker",
+                    "exec",
+                    current_cid,
+                    "bash",
+                    "-lc",
+                    "cd /testbed && git status --porcelain && echo '===DIFF===' && git diff",
+                ]
+                debug_result = subprocess.run(
+                    debug_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                debug_output = (debug_result.stdout or "") + ("\n" + debug_result.stderr if debug_result.stderr else "")
+            else:
+                debug_output = "No container id available for docker exec debug capture.\n"
+            container_git_path.write_text(debug_output, encoding="utf-8")
+        except Exception as exc:
+            print(f"  WARNING: failed to write container git debug dump: {exc}")
 
         patch = ""
         if current_cid:

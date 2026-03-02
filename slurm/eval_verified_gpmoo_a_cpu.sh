@@ -20,6 +20,33 @@
 #SBATCH -e slurm-eval-%j.err
 set -euo pipefail
 
+timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+log() {
+    echo "[$(timestamp)] [eval_cpu] $*"
+}
+
+section() {
+    echo
+    echo "[$(timestamp)] [eval_cpu] ============================================================"
+    echo "[$(timestamp)] [eval_cpu] $*"
+    echo "[$(timestamp)] [eval_cpu] ============================================================"
+}
+
+run_cmd() {
+    log "RUN: $*"
+    "$@"
+    log "DONE: $*"
+}
+
+START_TS="$(date +%s)"
+log "Job bootstrap started"
+log "SLURM_JOB_ID=${SLURM_JOB_ID:-<none>}"
+log "SLURM_JOB_NAME=${SLURM_JOB_NAME:-<none>}"
+log "SLURM_NODELIST=${SLURM_NODELIST:-<none>}"
+
 REPO_ROOT="${REPO_ROOT:-$PWD}"
 ENV_NAME="${ENV_NAME:-contexttune-py311}"
 MODEL_NAME="${MODEL_NAME:?set MODEL_NAME}"
@@ -34,29 +61,58 @@ MAX_WORKERS_EVAL="${MAX_WORKERS_EVAL:-4}"
 TIMEOUT_S="${TIMEOUT_S:-600}"
 STEP_LIMIT="${STEP_LIMIT:-30}"
 
+section "Step 1/6: Environment bootstrap"
+log "Changing directory to REPO_ROOT=$REPO_ROOT"
 cd "$REPO_ROOT"
+log "Current directory: $(pwd)"
+log "Initializing conda from /shared/bin/anaconda3/etc/profile.d/conda.sh"
 source /shared/bin/anaconda3/etc/profile.d/conda.sh
+log "Activating conda env: $ENV_NAME"
 conda activate "$ENV_NAME"
+log "Python executable: $(command -v python)"
+log "Python version: $(python --version 2>&1)"
 
-echo "============================================================"
-echo "SWE-bench Verified Evaluation"
-echo "Experiment: $EXP_ID"
-echo "Model: $MODEL_NAME"
-echo "Repo config: $REPO_CONFIG"
-echo "Conditions: $CONDITIONS"
-echo "============================================================"
+section "Step 2/6: Run configuration"
+log "Experiment: $EXP_ID"
+log "Model: $MODEL_NAME"
+log "Repo config: $REPO_CONFIG"
+log "Conditions: $CONDITIONS"
+log "Dataset: $DATASET_NAME"
+log "Instance IDs file: ${IDS_FILE:-<not set>}"
+log "Max workers eval: $MAX_WORKERS_EVAL"
+log "Timeout (s): $TIMEOUT_S"
+log "Step limit: $STEP_LIMIT"
+log "Oracle iterations: $ORACLE_ITERATIONS"
 
+section "Step 3/6: Input validation"
 if [[ ! -f "$REPO_CONFIG" ]]; then
-    echo "ERROR: repo config not found: $REPO_CONFIG"
+    log "ERROR: repo config not found: $REPO_CONFIG"
     exit 1
 fi
+log "Repo config found: $REPO_CONFIG"
 
+if [[ -n "$IDS_FILE" ]]; then
+    if [[ ! -f "$IDS_FILE" ]]; then
+        log "ERROR: IDS_FILE provided but not found: $IDS_FILE"
+        exit 1
+    fi
+    log "Instance IDs file found: $IDS_FILE"
+else
+    log "No IDS_FILE provided; full split will be used"
+fi
+
+section "Step 4/6: Build dynamic flags"
 IDS_FLAG=""
 if [[ -n "$IDS_FILE" ]]; then
     IDS_FLAG="--eval-instance-ids $IDS_FILE"
+    log "Using IDS_FLAG: $IDS_FLAG"
+else
+    log "IDS_FLAG is empty"
 fi
 
-python scripts/run_experiment.py \
+section "Step 5/6: Execute experiment pipeline"
+log "Launching scripts/run_experiment.py"
+run_cmd python scripts/run_experiment.py \
     --model "$MODEL_NAME" \
     --repo-config "$REPO_CONFIG" \
     --experiment-id "$EXP_ID" \
@@ -68,4 +124,8 @@ python scripts/run_experiment.py \
     --step-limit "$STEP_LIMIT" \
     $IDS_FLAG
 
-echo "Evaluation complete. Check results/${EXP_ID}/experiment_summary.json"
+section "Step 6/6: Completion"
+END_TS="$(date +%s)"
+ELAPSED="$((END_TS - START_TS))"
+log "Evaluation complete. Check results/${EXP_ID}/experiment_summary.json"
+log "Total elapsed seconds: $ELAPSED"

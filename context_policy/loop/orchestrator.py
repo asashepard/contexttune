@@ -119,6 +119,28 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
     config_path = exp_root / "experiment_config.json"
     config_path.write_text(json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8")
 
+    # Optional repo restriction: if eval instance IDs are provided, tune/prep only
+    # repos that appear in those eval instances.
+    eval_instances_prefiltered: list[dict] | None = None
+    restricted_repos: set[str] | None = None
+    if config.eval_instance_ids_file:
+        prefilter_ids = read_instance_ids(config.eval_instance_ids_file)
+        eval_instances_prefiltered = load_instances(
+            dataset_name=config.eval_dataset,
+            split=config.eval_split,
+            instance_ids=prefilter_ids,
+        )
+        restricted_repos = {inst["repo"] for inst in eval_instances_prefiltered}
+
+        repo_order = [r["repo"] for r in config.repos]
+        restricted_in_config = [r for r in repo_order if r in restricted_repos]
+        skipped_count = len(repo_order) - len(restricted_in_config)
+        print(
+            "[experiment] eval_instance_ids provided: restricting tuning/prep "
+            f"to {len(restricted_in_config)}/{len(repo_order)} repos "
+            f"(skipped {skipped_count}): {', '.join(restricted_in_config)}"
+        )
+
     # ── Phase 1: Build KB + Oracle tuning ──────────────────────
     # Determine which repos need oracle tuning
     needs_kb = "static_kb" in config.conditions or "oracle_tuned" in config.conditions
@@ -130,6 +152,9 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
     for repo_info in config.repos:
         repo = repo_info["repo"]
         commit = repo_info["commit"]
+
+        if restricted_repos is not None and repo not in restricted_repos:
+            continue
 
         guidance_map.setdefault(repo, {})
 
@@ -196,14 +221,17 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
     print(f"{'='*60}")
 
     instance_ids = None
-    if config.eval_instance_ids_file:
-        instance_ids = read_instance_ids(config.eval_instance_ids_file)
+    if eval_instances_prefiltered is not None:
+        eval_instances = eval_instances_prefiltered
+    else:
+        if config.eval_instance_ids_file:
+            instance_ids = read_instance_ids(config.eval_instance_ids_file)
 
-    eval_instances = load_instances(
-        dataset_name=config.eval_dataset,
-        split=config.eval_split,
-        instance_ids=instance_ids,
-    )
+        eval_instances = load_instances(
+            dataset_name=config.eval_dataset,
+            split=config.eval_split,
+            instance_ids=instance_ids,
+        )
     print(f"  Loaded {len(eval_instances)} eval instances")
 
     # Group instances by repo

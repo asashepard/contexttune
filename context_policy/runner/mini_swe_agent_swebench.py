@@ -254,24 +254,29 @@ def _extract_diff_from_container(container_id: str) -> str:
         print(f"  WARNING: container inspect failed: {e}")
         return ""
 
-    # Try common repo locations in SWE-bench containers
+    # Include untracked/new files by staging everything first, then reading cached diff.
+    # Try common repo locations in SWE-bench containers.
     for workdir in ["/testbed", "/workspace", "/repo"]:
-        # Try unstaged, staged (--cached), and all-vs-HEAD diffs
-        for diff_args in [["git", "diff"], ["git", "diff", "--cached"], ["git", "diff", "HEAD"]]:
-            try:
-                result = subprocess.run(
-                    ["docker", "exec", "-w", workdir, container_id] + diff_args,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    diff = result.stdout.strip()
-                    cmd_label = " ".join(diff_args)
-                    print(f"  Extracted '{cmd_label}' from container at {workdir} ({len(diff)} chars)")
-                    return diff
-            except Exception:
-                continue
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container_id,
+                    "bash",
+                    "-lc",
+                    f"cd {workdir} && git add -A && git diff --cached",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                diff = result.stdout.strip()
+                print(f"  Extracted cached diff from container at {workdir} ({len(diff)} chars)")
+                return diff
+        except Exception:
+            continue
 
     # No diff found — check if the workdir even exists
     for workdir in ["/testbed", "/workspace", "/repo"]:
@@ -377,9 +382,9 @@ def _run_agent_in_docker(
         # Override step_limit and cost_limit with our experiment values.
         # cost_limit default is $3 which may trigger LimitsExceeded prematurely.
         agent_kwargs["step_limit"] = step_limit
-        agent_kwargs["cost_limit"] = 0.0  # disable; we control via step_limit + timeout
+        agent_kwargs["cost_limit"] = 1e9  # effectively unlimited for experiment runs
 
-        print(f"  Creating agent: step_limit={step_limit}, cost_limit=0 (unlimited)")
+        print(f"  Creating agent: step_limit={step_limit}, cost_limit=1e9 (effectively unlimited)")
         print(f"  Agent config keys: {sorted(agent_kwargs.keys())}")
         agent = DefaultAgent(
             model=model_instance,
@@ -414,7 +419,7 @@ def _run_agent_in_docker(
                     current_cid,
                     "bash",
                     "-lc",
-                    "cd /testbed && git status --porcelain && echo '===DIFF===' && git diff",
+                    "cd /testbed && git status --porcelain && echo '===CACHED_DIFF===' && git add -A && git diff --cached",
                 ]
                 debug_result = subprocess.run(
                     debug_cmd,

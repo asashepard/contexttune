@@ -139,7 +139,7 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
             "[experiment] eval_instance_ids provided: restricting tuning/prep "
             f"to {len(restricted_in_config)}/{len(repo_order)} repos "
             f"(skipped {skipped_count}): {', '.join(restricted_in_config)}"
-        )
+        , flush=True)
 
     # ── Phase 1: Build KB + Oracle tuning ──────────────────────
     # Determine which repos need oracle tuning

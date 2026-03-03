@@ -110,9 +110,45 @@ else
     log "IDS_FLAG is empty"
 fi
 
+if [[ -n "$IDS_FILE" ]]; then
+    section "Step 4.5/6: Repo restriction preview"
+    log "Computing repos represented by IDS_FILE (pre-run confirmation)"
+    run_cmd python -u - <<'PY'
+import os
+import json
+from pathlib import Path
+from context_policy.datasets.swebench import load_instances, read_instance_ids
+
+dataset_name = os.environ["DATASET_NAME"]
+split = "test"
+ids_file = os.environ["IDS_FILE"]
+repo_config = os.environ["REPO_CONFIG"]
+
+ids = read_instance_ids(ids_file)
+instances = load_instances(dataset_name=dataset_name, split=split, instance_ids=ids)
+repos_from_ids = sorted({inst["repo"] for inst in instances})
+
+repo_config_rows = json.loads(Path(repo_config).read_text(encoding="utf-8"))
+repos_in_config = [row["repo"] for row in repo_config_rows]
+effective_repos = [repo for repo in repos_in_config if repo in set(repos_from_ids)]
+skipped_count = len(repos_in_config) - len(effective_repos)
+
+print(f"[eval_cpu] Restriction preview: {len(ids)} eval IDs map to {len(repos_from_ids)} repo(s)")
+print(f"[eval_cpu] Repos from IDS_FILE: {', '.join(repos_from_ids)}")
+print(
+    f"[eval_cpu] Effective tuning repos (in REPO_CONFIG): "
+    f"{len(effective_repos)}/{len(repos_in_config)} (skipped {skipped_count})"
+)
+print(f"[eval_cpu] Effective tuning repo list: {', '.join(effective_repos)}")
+print(f"[eval_cpu] Repo config source remains: {repo_config}")
+PY
+fi
+
 section "Step 5/6: Execute experiment pipeline"
 log "Launching scripts/run_experiment.py"
-run_cmd python scripts/run_experiment.py \
+export PYTHONUNBUFFERED=1
+log "PYTHONUNBUFFERED=$PYTHONUNBUFFERED (ensures live orchestrator logs)"
+run_cmd python -u scripts/run_experiment.py \
     --model "$MODEL_NAME" \
     --repo-config "$REPO_CONFIG" \
     --experiment-id "$EXP_ID" \

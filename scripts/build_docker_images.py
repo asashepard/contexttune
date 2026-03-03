@@ -145,8 +145,14 @@ def main() -> int:
         "--run_id", run_id,
         "--max_workers", str(args.max_workers),
         "--cache_level", "none",
-        "--force_rebuild", "true",
     ]
+
+    # Only force rebuild when explicitly requested.
+    # When forcing, set namespace to "none" to avoid the harness conflict:
+    # "Cannot force rebuild and use a namespace at the same time."
+    if args.force:
+        cmd.extend(["--force_rebuild", "true", "--namespace", "none"])
+
     print(f"CMD: {' '.join(cmd)}")
     result = subprocess.run(cmd)
 

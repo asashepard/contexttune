@@ -144,6 +144,45 @@ print(f"[eval_cpu] Repo config source remains: {repo_config}")
 PY
 fi
 
+if [[ -n "$IDS_FILE" ]]; then
+    section "Step 4.6/6: Auto-build + verify SWE-bench Docker images"
+    log "Building Docker images for IDS_FILE before inference/eval"
+    run_cmd python scripts/build_docker_images.py \
+        --instance_ids_file "$IDS_FILE" \
+        --dataset_name "$DATASET_NAME" \
+        --split test \
+        --max_workers "$MAX_WORKERS_EVAL"
+
+    log "Verifying required images exist for every instance in IDS_FILE"
+    run_cmd python -u - "$DATASET_NAME" "$IDS_FILE" <<'PY'
+import sys
+from context_policy.datasets.swebench import load_instances, read_instance_ids
+from context_policy.runner.mini_swe_agent_swebench import (
+    _docker_image_exists,
+    _get_instance_docker_image,
+)
+
+dataset_name = sys.argv[1]
+ids_file = sys.argv[2]
+ids = read_instance_ids(ids_file)
+instances = load_instances(dataset_name=dataset_name, split="test", instance_ids=ids)
+
+missing: list[tuple[str, str]] = []
+for inst in instances:
+    image = _get_instance_docker_image(inst)
+    if not _docker_image_exists(image):
+        missing.append((inst["instance_id"], image))
+
+if missing:
+    print("[eval_cpu] ERROR: Missing required SWE-bench Docker images after build:")
+    for iid, image in missing:
+        print(f"  - {iid} -> {image}")
+    raise SystemExit(1)
+
+print(f"[eval_cpu] Verified Docker images for all {len(instances)} instance(s)")
+PY
+fi
+
 section "Step 5/6: Execute experiment pipeline"
 log "Launching scripts/run_experiment.py"
 export PYTHONUNBUFFERED=1

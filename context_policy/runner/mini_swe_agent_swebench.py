@@ -29,6 +29,9 @@ from context_policy.runner.patch_utils import (
 # Default step limit to prevent the agent from looping indefinitely.
 # Experiment spec v1.1 uses 30 steps.
 DEFAULT_MAX_STEPS = 30
+DEFAULT_AGENT_MAX_TOKENS = 1024
+DEFAULT_CONTEXT_WINDOW_TOKENS = 32768
+DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS = 256
 
 
 def _first_nonempty_env(*keys: str) -> str | None:
@@ -61,7 +64,76 @@ def _litellm_model_kwargs_from_env() -> dict[str, Any]:
     if api_version:
         model_kwargs["api_version"] = api_version
 
+    env_max_tokens = _first_nonempty_env("LITELLM_MAX_TOKENS", "OPENAI_MAX_TOKENS")
+    if env_max_tokens:
+        try:
+            parsed = int(env_max_tokens)
+            if parsed > 0:
+                model_kwargs["max_tokens"] = parsed
+        except ValueError:
+            pass
+
     return model_kwargs
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate (heuristic): ~4 chars per token."""
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _resolve_context_window_tokens() -> int:
+    raw = _first_nonempty_env(
+        "AGENT_CONTEXT_WINDOW_TOKENS",
+        "OPENAI_CONTEXT_WINDOW_TOKENS",
+        "LITELLM_CONTEXT_WINDOW_TOKENS",
+        "VLLM_MAX_MODEL_LEN",
+    )
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    return DEFAULT_CONTEXT_WINDOW_TOKENS
+
+
+def _trim_context_for_token_budget(
+    problem_statement: str,
+    context_md: str | None,
+    *,
+    max_output_tokens: int,
+    context_window_tokens: int,
+    safety_margin_tokens: int = DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
+) -> tuple[str, str | None, int, bool]:
+    """Trim context block so prompt leaves room for output tokens.
+
+    Returns:
+      (task, trimmed_context, estimated_prompt_tokens, was_trimmed)
+    """
+    if not context_md:
+        task = build_task_with_context(problem_statement, None)
+        return task, None, _estimate_tokens(task), False
+
+    task_with_context = build_task_with_context(problem_statement, context_md)
+    estimated_prompt_tokens = _estimate_tokens(task_with_context)
+    allowed_prompt_tokens = max(1, context_window_tokens - max_output_tokens - safety_margin_tokens)
+    if estimated_prompt_tokens <= allowed_prompt_tokens:
+        return task_with_context, context_md, estimated_prompt_tokens, False
+
+    base_task = build_task_with_context(problem_statement, None)
+    base_tokens = _estimate_tokens(base_task)
+    if base_tokens >= allowed_prompt_tokens:
+        # Even without context we're near/over budget; drop context entirely.
+        return base_task, None, base_tokens, True
+
+    remaining_for_context_tokens = max(0, allowed_prompt_tokens - base_tokens)
+    remaining_for_context_chars = max(0, remaining_for_context_tokens * 4)
+    trimmed_context = context_md[:remaining_for_context_chars]
+    trimmed_task = build_task_with_context(problem_statement, trimmed_context)
+    return trimmed_task, trimmed_context, _estimate_tokens(trimmed_task), True
 
 
 def _sum_int(v: Any) -> int:
@@ -374,9 +446,18 @@ def _run_agent_in_docker(
         print(f"  Container ID after env init: {container_id}")
 
         model_kwargs = _litellm_model_kwargs_from_env()
+        model_kwargs.setdefault("max_tokens", DEFAULT_AGENT_MAX_TOKENS)
+        chosen_max_tokens = model_kwargs.get("max_tokens")
+        estimated_prompt_tokens = _estimate_tokens(task)
+        context_window_tokens = _resolve_context_window_tokens()
         debug_base = model_kwargs.get("api_base") or "<default>"
         debug_provider = model_kwargs.get("custom_llm_provider") or "<auto>"
-        print(f"  Model routing: model={model!r}, api_base={debug_base!r}, provider={debug_provider!r}")
+        print(
+            "  Model routing: "
+            f"model={model!r}, api_base={debug_base!r}, provider={debug_provider!r}, "
+            f"max_tokens={chosen_max_tokens}, est_prompt_tokens={estimated_prompt_tokens}, "
+            f"context_window_tokens={context_window_tokens}"
+        )
         model_instance = LitellmModel(model_name=model, model_kwargs=model_kwargs)
 
         # Override step_limit and cost_limit with our experiment values.
@@ -635,8 +716,40 @@ def generate_patch_with_mini_swebench_result(
             "trajectory_path": None,
         }
 
-    # Build task with context
-    task = build_task_with_context(problem_statement, context_md)
+    # Build task with context, trimming context block if needed to preserve
+    # output-token room near context limits.
+    desired_max_tokens_raw = _first_nonempty_env("LITELLM_MAX_TOKENS", "OPENAI_MAX_TOKENS")
+    desired_max_tokens = DEFAULT_AGENT_MAX_TOKENS
+    if desired_max_tokens_raw:
+        try:
+            parsed = int(desired_max_tokens_raw)
+            if parsed > 0:
+                desired_max_tokens = parsed
+        except ValueError:
+            pass
+
+    context_window_tokens = _resolve_context_window_tokens()
+    task, trimmed_context, est_prompt_tokens, was_trimmed = _trim_context_for_token_budget(
+        problem_statement,
+        context_md,
+        max_output_tokens=desired_max_tokens,
+        context_window_tokens=context_window_tokens,
+    )
+    if was_trimmed:
+        before_chars = len(context_md or "")
+        after_chars = len(trimmed_context or "")
+        print(
+            "  Context budget trim applied: "
+            f"before={before_chars} chars, after={after_chars} chars, "
+            f"est_prompt_tokens={est_prompt_tokens}, max_tokens={desired_max_tokens}, "
+            f"context_window_tokens={context_window_tokens}"
+        )
+    else:
+        print(
+            "  Context budget check: "
+            f"est_prompt_tokens={est_prompt_tokens}, max_tokens={desired_max_tokens}, "
+            f"context_window_tokens={context_window_tokens}"
+        )
 
     # Create trajectory file path
     if traj_dir:

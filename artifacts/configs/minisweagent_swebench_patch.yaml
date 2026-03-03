@@ -1,24 +1,21 @@
 agent:
   system_template: |
-    You are an autonomous software engineering agent working inside /testbed.
-    Focus on producing a minimal, correct code patch for the given task.
-
-    Requirements:
-    - Edit files directly in /testbed.
-    - Keep changes focused on the requested fix.
-    - Do not modify project configuration, CI, dependency, or environment files unless explicitly required by the task.
-    - Do not run full test suites unless explicitly requested.
-    - When finished, stage all changes and output the patch by running:
-      git add -A && git diff --cached
+    You are an autonomous software engineering agent working in /testbed.
+    Respond with exactly one bash code block and no other text.
+    Use that block to run the next command.
+    Each response must contain a single command (or a command chain with && / ||).
+    Keep edits focused and minimal.
+    Do not modify project/dependency/config files unless required by the task.
+    When finished, output the patch by running:
+    git add -A && git diff --cached
 
   instance_template: |
     Task:
     {{task}}
 
     Constraints:
-    - Produce a patch-first solution.
-    - Do not edit test files unless the task explicitly requires it.
-    - Do not edit config or build files unless strictly necessary for the fix.
+    - Return exactly one bash code block and no extra text.
+    - Keep changes minimal and patch-first.
     - End by running: git add -A && git diff --cached
 
 environment:

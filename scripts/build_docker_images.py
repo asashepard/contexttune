@@ -14,6 +14,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -126,19 +127,25 @@ def main() -> int:
             f.write(json.dumps(record) + "\n")
         preds_path = f.name
 
+    run_id = datetime.now(timezone.utc).strftime("image_build_%Y%m%d_%H%M%S")
+
     print(f"Building {len(instances)} Docker images...")
     print(f"  Dummy predictions: {preds_path}")
+    print(f"  Run ID: {run_id}")
     print(f"  Workers: {args.max_workers}")
     print()
 
-    # Run swebench harness to build images
+    # Run swebench harness to build images.
+    # Use a unique run_id and no cache retention so image building cannot be
+    # skipped due to prior evaluation cache artifacts.
     cmd = [
         sys.executable, "-m", "swebench.harness.run_evaluation",
         "--dataset_name", args.dataset_name,
         "--predictions_path", preds_path,
-        "--run_id", "image_build",
+        "--run_id", run_id,
         "--max_workers", str(args.max_workers),
-        "--cache_level", "instance",
+        "--cache_level", "none",
+        "--force_rebuild", "true",
     ]
     print(f"CMD: {' '.join(cmd)}")
     result = subprocess.run(cmd)

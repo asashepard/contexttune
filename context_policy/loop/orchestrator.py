@@ -240,6 +240,80 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
     instances_by_repo: dict[str, list[dict]] = {}
     for inst in eval_instances:
         instances_by_repo.setdefault(inst["repo"], []).append(inst)
+    expected_instance_ids = {inst["instance_id"] for inst in eval_instances}
+    expected_total = len(expected_instance_ids)
+
+    def _collect_condition_generation_stats(
+        metrics_path: Path,
+        preds_path: Path,
+        target_ids: set[str],
+    ) -> dict:
+        metrics_by_id: dict[str, dict] = {}
+        if metrics_path.exists():
+            for rec in read_jsonl(metrics_path):
+                iid = rec.get("instance_id")
+                if iid in target_ids:
+                    metrics_by_id[iid] = rec
+
+        preds_by_id: dict[str, dict] = {}
+        if preds_path.exists():
+            for rec in read_jsonl(preds_path):
+                iid = rec.get("instance_id")
+                if iid in target_ids:
+                    preds_by_id[iid] = rec
+
+        attempted = len(target_ids)
+        patch_non_empty = 0
+        empty_patch_count = 0
+        missing_image_count = 0
+        error_count = 0
+        elapsed_s = 0.0
+        token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+        for iid in target_ids:
+            metric = metrics_by_id.get(iid)
+            pred = preds_by_id.get(iid, {})
+            patch_text = pred.get("model_patch", "") if isinstance(pred, dict) else ""
+
+            if metric is not None:
+                patch_non_empty_i = bool(metric.get("patch_non_empty"))
+                elapsed_s += float(metric.get("elapsed_s", 0.0) or 0.0)
+                usage = metric.get("token_usage", {}) if isinstance(metric, dict) else {}
+                token_usage["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+                token_usage["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+                token_usage["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+
+                status = str(metric.get("status", "") or "")
+                if status == "missing_image":
+                    missing_image_count += 1
+                elif status == "error":
+                    error_count += 1
+                elif not patch_non_empty_i:
+                    empty_patch_count += 1
+            else:
+                patch_non_empty_i = bool(patch_text and str(patch_text).strip())
+                if not patch_non_empty_i:
+                    empty_patch_count += 1
+
+            if patch_non_empty_i:
+                patch_non_empty += 1
+
+        return {
+            "attempted": attempted,
+            "instances_processed": attempted,
+            "patch_non_empty": patch_non_empty,
+            "patch_non_empty_rate": (patch_non_empty / attempted) if attempted else 0.0,
+            "empty_patch_count": empty_patch_count,
+            "missing_image_count": missing_image_count,
+            "error_count": error_count,
+            "elapsed_s": elapsed_s,
+            "mean_elapsed_s": (elapsed_s / attempted) if attempted else 0.0,
+            "token_usage": token_usage,
+        }
 
     eval_results: dict[str, dict] = {}
 
@@ -258,15 +332,6 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
             for rec in read_jsonl(cond_metrics_path):
                 completed_metrics[rec["instance_id"]] = rec
 
-        condition_elapsed_s = 0.0
-        condition_non_empty = 0
-        condition_total = 0
-        condition_tokens = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        }
-
         total_instances = sum(len(v) for v in instances_by_repo.values())
         done_count = len(completed_ids)
 
@@ -284,16 +349,6 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
             for i, instance in enumerate(instances):
                 iid = instance["instance_id"]
                 if iid in completed_ids:
-                    prev = completed_metrics.get(iid)
-                    if prev:
-                        condition_elapsed_s += float(prev.get("elapsed_s", 0.0) or 0.0)
-                        if prev.get("patch_non_empty"):
-                            condition_non_empty += 1
-                        usage = prev.get("token_usage", {})
-                        condition_tokens["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
-                        condition_tokens["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
-                        condition_tokens["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
-                        condition_total += 1
                     continue
 
                 try:
@@ -364,14 +419,6 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
                 with cond_metrics_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(metrics_record, sort_keys=True, ensure_ascii=False) + "\n")
 
-                condition_elapsed_s += metrics_record["elapsed_s"]
-                if metrics_record["patch_non_empty"]:
-                    condition_non_empty += 1
-                condition_total += 1
-                condition_tokens["prompt_tokens"] += metrics_record["token_usage"]["prompt_tokens"]
-                condition_tokens["completion_tokens"] += metrics_record["token_usage"]["completion_tokens"]
-                condition_tokens["total_tokens"] += metrics_record["token_usage"]["total_tokens"]
-
                 done_count += 1
                 status = "OK" if patch else "EMPTY"
                 print(f"  [{condition}] [{done_count}/{total_instances}] {iid} -> {status}")
@@ -401,29 +448,36 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
         if rc != 0:
             print(f"  WARNING: eval harness failed for {condition}")
 
-        # Load results
+        generation_metrics = _collect_condition_generation_stats(
+            cond_metrics_path,
+            cond_preds_path,
+            expected_instance_ids,
+        )
+
+        resolved = 0
+        load_error = None
         try:
             from context_policy.report.summarize import compute_rate, load_results
-            resolved, total = load_results(RESULTS_DIR / run_id)
-            eval_results[condition] = {
-                "run_id": run_id,
-                "resolved": resolved,
-                "total": total,
-                "rate": compute_rate(resolved, total),
-                "preds_path": str(cond_preds_path),
-                "instance_metrics_path": str(cond_metrics_path),
-                "generation_metrics": {
-                    "instances_processed": condition_total,
-                    "patch_non_empty": condition_non_empty,
-                    "patch_non_empty_rate": (condition_non_empty / condition_total) if condition_total else 0.0,
-                    "elapsed_s": condition_elapsed_s,
-                    "mean_elapsed_s": (condition_elapsed_s / condition_total) if condition_total else 0.0,
-                    "token_usage": condition_tokens,
-                },
-            }
+
+            resolved, _harness_total = load_results(RESULTS_DIR / run_id)
+            rate = compute_rate(resolved, expected_total)
         except Exception as exc:
             print(f"  WARNING: could not load results for {condition}: {exc}")
-            eval_results[condition] = {"error": str(exc)}
+            load_error = str(exc)
+            rate = 0.0
+
+        eval_results[condition] = {
+            "run_id": run_id,
+            "resolved": resolved,
+            "total": expected_total,
+            "attempted": expected_total,
+            "rate": rate,
+            "preds_path": str(cond_preds_path),
+            "instance_metrics_path": str(cond_metrics_path),
+            "generation_metrics": generation_metrics,
+        }
+        if load_error is not None:
+            eval_results[condition]["error"] = load_error
 
     # ── Summary ────────────────────────────────────────────────
     summary = {

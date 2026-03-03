@@ -30,7 +30,7 @@ from context_policy.runner.patch_utils import (
 # Experiment spec v1.1 uses 30 steps.
 DEFAULT_MAX_STEPS = 30
 DEFAULT_AGENT_MAX_TOKENS = 1024
-DEFAULT_CONTEXT_WINDOW_TOKENS = 32768
+DEFAULT_CONTEXT_WINDOW_TOKENS = 19968
 DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS = 512
 DEFAULT_CONTEXT_BOUNDARY_BUFFER_TOKENS = 32
 
@@ -86,10 +86,10 @@ def _estimate_tokens(text: str) -> int:
 
 def _resolve_context_window_tokens() -> int:
     raw = _first_nonempty_env(
-        "AGENT_CONTEXT_WINDOW_TOKENS",
-        "OPENAI_CONTEXT_WINDOW_TOKENS",
-        "LITELLM_CONTEXT_WINDOW_TOKENS",
         "VLLM_MAX_MODEL_LEN",
+        "LITELLM_CONTEXT_WINDOW_TOKENS",
+        "OPENAI_CONTEXT_WINDOW_TOKENS",
+        "AGENT_CONTEXT_WINDOW_TOKENS",
     )
     if raw:
         try:

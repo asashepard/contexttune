@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 
 
 # Maximum allowed patch size (chars) - safety limit
@@ -89,3 +90,79 @@ def extract_patch_from_trajectory(traj_path: str) -> str:
                         return diff
 
     return ""
+
+
+def _strip_to_first_fenced_diff_block(text: str) -> str:
+    """If fenced blocks exist, keep only the first one containing a diff marker."""
+    if "```" not in text:
+        return text
+
+    fence_pattern = r"```[^\n]*\n(.*?)```"
+    matches = re.findall(fence_pattern, text, re.DOTALL)
+    for block in matches:
+        for line in block.splitlines():
+            if line.startswith("diff --git ") or line.startswith("--- a/"):
+                return block.strip()
+
+    # If fenced blocks exist but none look like a diff, remove fence markers.
+    return text.replace("```", "")
+
+
+def _slice_from_first_diff_start(text: str) -> str:
+    """Keep content starting at the first unified-diff start marker."""
+    lines = text.splitlines()
+    start_index = None
+    for idx, line in enumerate(lines):
+        if line.startswith("diff --git ") or line.startswith("--- a/"):
+            start_index = idx
+            break
+    if start_index is None:
+        return ""
+    return "\n".join(lines[start_index:]).strip()
+
+
+def _is_noop_diff(patch: str) -> bool:
+    """Return True when a diff has no effective changes.
+
+    A patch is treated as no-op when:
+    - it is empty, or
+    - it has no +/- hunk lines, or
+    - removed and added hunk lines are identical as multisets.
+    """
+    if not patch or not patch.strip():
+        return True
+
+    minus_lines: list[str] = []
+    plus_lines: list[str] = []
+
+    for line in patch.splitlines():
+        if line.startswith("--- ") or line.startswith("+++ "):
+            continue
+        if line.startswith("-"):
+            minus_lines.append(line[1:])
+        elif line.startswith("+"):
+            plus_lines.append(line[1:])
+
+    if not minus_lines and not plus_lines:
+        return True
+
+    return Counter(minus_lines) == Counter(plus_lines)
+
+
+def sanitize_patch_for_preds(patch: str) -> tuple[str, bool]:
+    """Sanitize a patch before writing model_patch to preds.jsonl.
+
+    Steps:
+    1) If fenced blocks are present, keep the first fenced block with diff markers.
+    2) Keep only content from first `diff --git` or `--- a/` line onward.
+    3) Treat empty/no-op diffs as empty patch.
+
+    Returns:
+        (sanitized_patch, is_noop)
+    """
+    candidate = _strip_to_first_fenced_diff_block(patch or "")
+    sanitized = _slice_from_first_diff_start(candidate)
+    is_noop = _is_noop_diff(sanitized)
+    if is_noop:
+        return "", True
+    return sanitized, False

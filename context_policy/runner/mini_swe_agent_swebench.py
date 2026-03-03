@@ -23,7 +23,7 @@ from context_policy.runner.mini_swe_agent import (
 from context_policy.runner.patch_utils import (
     MAX_PATCH_SIZE,
     extract_diff,
-    extract_patch_from_trajectory,
+    sanitize_patch_for_preds,
 )
 
 # Default step limit to prevent the agent from looping indefinitely.
@@ -550,14 +550,50 @@ def _run_agent_in_docker(
             print(f"  WARNING: failed to write container git debug dump: {exc}")
 
         patch = ""
+        patch_source = "empty"
+        container_patch_raw = ""
+        container_patch = ""
+        model_patch_raw = ""
+        model_patch = ""
+        container_noop = True
+        model_noop = True
         if current_cid:
-            patch = _extract_diff_from_container(current_cid)
+            container_patch_raw = _extract_diff_from_container(current_cid)
+            container_patch, container_noop = sanitize_patch_for_preds(container_patch_raw)
 
-        # Fallback: check if agent returned a diff in result_detail
-        if not patch and result_detail:
-            patch = extract_diff(result_detail)
-            if patch:
-                print(f"  Extracted patch from agent output ({len(patch)} chars)")
+        # Parse model output as a candidate only; container diff remains authoritative
+        # whenever a container is available for inspection.
+        if result_detail:
+            model_patch_raw = extract_diff(result_detail)
+            if model_patch_raw:
+                model_patch, model_noop = sanitize_patch_for_preds(model_patch_raw)
+
+        if container_patch:
+            patch = container_patch
+            patch_source = "container"
+        elif current_cid:
+            # Container was available and had no real staged diff, so treat as empty,
+            # even if model emitted patch-like/markdown output.
+            patch = ""
+            patch_source = "empty"
+            if model_patch:
+                print(
+                    "  Ignoring model-emitted patch because container staged diff is empty"
+                )
+        elif model_patch:
+            # Only accept model-derived diff when container inspection is unavailable.
+            patch = model_patch
+            patch_source = "model"
+        else:
+            patch = ""
+            patch_source = "empty"
+
+        print(
+            "  Patch selection: "
+            f"patch_source={patch_source}, sanitized_patch_len={len(patch)}, "
+            f"container_raw_len={len(container_patch_raw)}, container_no_op={container_noop}, "
+            f"model_raw_len={len(model_patch_raw)}, model_no_op={model_noop}"
+        )
 
         # ---- Save trajectory / agent output for debugging ----
         try:
@@ -570,6 +606,7 @@ def _run_agent_in_docker(
                 "result_label": result_label,
                 "result_detail": result_detail,
                 "patch_len": len(patch) if patch else 0,
+                "patch_source": patch_source,
                 "container_id": container_id,
             }
             if messages:
@@ -598,7 +635,22 @@ def _run_agent_in_docker(
         fallback = ""
         cid = _get_running_container_id() or container_id
         if cid:
-            fallback = _extract_diff_from_container(cid)
+            fallback_raw = _extract_diff_from_container(cid)
+            fallback, fallback_noop = sanitize_patch_for_preds(fallback_raw)
+            if fallback:
+                print(
+                    "  Patch selection: "
+                    f"patch_source=container, sanitized_patch_len={len(fallback)}, "
+                    f"container_raw_len={len(fallback_raw)}, container_no_op={fallback_noop}, "
+                    "model_raw_len=0, model_no_op=True"
+                )
+            else:
+                print(
+                    "  Patch selection: "
+                    f"patch_source=empty, sanitized_patch_len=0, "
+                    f"container_raw_len={len(fallback_raw)}, container_no_op={fallback_noop}, "
+                    "model_raw_len=0, model_no_op=True"
+                )
         result_queue.put(
             (fallback, f"Agent error: {e}" if not fallback else None)
         )
@@ -626,7 +678,7 @@ def _stop_orphan_containers() -> None:
 
 
 def _salvage_patch(traj_path: Path, result_queue: multiprocessing.Queue) -> str:
-    """Try to recover a patch from the trajectory file or queue after timeout/crash.
+    """Try to recover a patch from the queue after timeout/crash.
 
     Returns the patch string, or "" if nothing found.
     """
@@ -634,18 +686,16 @@ def _salvage_patch(traj_path: Path, result_queue: multiprocessing.Queue) -> str:
     # between timeout firing and us checking.
     try:
         patch, error = result_queue.get_nowait()
-        if patch and not error and len(patch) <= MAX_PATCH_SIZE:
-            print(f"  Salvaged patch from queue ({len(patch)} chars)")
-            return patch
+        sanitized, is_noop = sanitize_patch_for_preds(patch or "")
+        if sanitized and not error and len(sanitized) <= MAX_PATCH_SIZE:
+            print(f"  Salvaged patch from queue ({len(sanitized)} chars)")
+            print(
+                "  Patch selection: "
+                f"patch_source=model, sanitized_patch_len={len(sanitized)}, no_op={is_noop}"
+            )
+            return sanitized
     except Exception:
         pass
-
-    # Try trajectory file
-    if traj_path.exists():
-        patch = extract_patch_from_trajectory(str(traj_path))
-        if patch and len(patch) <= MAX_PATCH_SIZE:
-            print(f"  Salvaged patch from trajectory ({len(patch)} chars)")
-            return patch
 
     return ""
 
@@ -840,8 +890,14 @@ def generate_patch_with_mini_swebench_result(
 
             if container_patch and len(container_patch) <= MAX_PATCH_SIZE:
                 print(f"  Recovered patch from container on timeout ({len(container_patch)} chars)")
+                sanitized_patch, is_noop = sanitize_patch_for_preds(container_patch)
+                print(
+                    "  Patch selection: "
+                    f"patch_source={'container' if sanitized_patch else 'empty'}, "
+                    f"sanitized_patch_len={len(sanitized_patch)}, no_op={is_noop}"
+                )
                 return {
-                    "patch": container_patch,
+                    "patch": sanitized_patch,
                     "elapsed_s": time.perf_counter() - started,
                     "token_usage": _read_traj_token_usage(traj_path),
                     "status": "timeout",
@@ -851,6 +907,10 @@ def generate_patch_with_mini_swebench_result(
 
             # Fall back to trajectory / queue
             salvage = _salvage_patch(traj_path, result_queue)
+            print(
+                "  Patch selection: "
+                f"patch_source={'model' if salvage else 'empty'}, sanitized_patch_len={len(salvage)}"
+            )
             return {
                 "patch": salvage,
                 "elapsed_s": time.perf_counter() - started,
@@ -867,6 +927,10 @@ def generate_patch_with_mini_swebench_result(
             print("  mini-swe-agent-swebench: no result in queue")
             # Process exited without putting result — try trajectory
             salvage = _salvage_patch(traj_path, result_queue)
+            print(
+                "  Patch selection: "
+                f"patch_source={'model' if salvage else 'empty'}, sanitized_patch_len={len(salvage)}"
+            )
             return {
                 "patch": salvage,
                 "elapsed_s": time.perf_counter() - started,
@@ -880,6 +944,10 @@ def generate_patch_with_mini_swebench_result(
             print(f"  mini-swe-agent-swebench error: {error}")
             # Even on error, trajectory might contain a partial patch
             salvage = _salvage_patch(traj_path, result_queue)
+            print(
+                "  Patch selection: "
+                f"patch_source={'model' if salvage else 'empty'}, sanitized_patch_len={len(salvage)}"
+            )
             return {
                 "patch": salvage,
                 "elapsed_s": time.perf_counter() - started,
@@ -889,9 +957,13 @@ def generate_patch_with_mini_swebench_result(
                 "trajectory_path": trajectory_path_value,
             }
 
-        # Try to extract patch from trajectory if agent didn't return it directly
-        if not patch and traj_path.exists():
-            patch = extract_patch_from_trajectory(str(traj_path))
+        sanitized_patch, is_noop = sanitize_patch_for_preds(patch or "")
+        if sanitized_patch != (patch or ""):
+            print(
+                "  Patch sanitation: "
+                f"sanitized_patch_len={len(sanitized_patch)}, no_op={is_noop}"
+            )
+        patch = sanitized_patch
 
         # Safety: reject oversized patches
         if patch and len(patch) > MAX_PATCH_SIZE:

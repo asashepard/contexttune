@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from context_policy.datasets.swebench import load_instances, read_instance_ids
 from context_policy.runner.mini_swe_agent import generate_patch_with_mini
 from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench
+from context_policy.runner.patch_utils import sanitize_patch_for_preds
 from context_policy.runner.single_shot import generate_patch
 from context_policy.utils.jsonl import read_jsonl
 from context_policy.utils.paths import LOGS_DIR, PREDS_DIR
@@ -289,6 +290,12 @@ def main() -> None:
                 )
             else:
                 raise ValueError(f"Unknown runner: {args.runner}")
+
+            patch, patch_is_noop = sanitize_patch_for_preds(patch)
+            print(
+                "  Patch sanitation: "
+                f"sanitized_patch_len={len(patch)}, no_op={patch_is_noop}"
+            )
 
             # Build prediction record
             record = {

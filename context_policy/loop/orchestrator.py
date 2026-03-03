@@ -19,6 +19,7 @@ from context_policy.datasets.swebench import load_instances, read_instance_ids
 from context_policy.guidance.schema import RepoGuidance
 from context_policy.oracle.loop import run_oracle_loop
 from context_policy.oracle.schema import OracleConfig
+from context_policy.runner.patch_utils import sanitize_patch_for_preds
 from context_policy.runner.mini_swe_agent_swebench import generate_patch_with_mini_swebench_result
 from context_policy.utils.jsonl import read_jsonl
 from context_policy.utils.paths import PREDS_DIR, PROJECT_ROOT, RESULTS_DIR
@@ -318,6 +319,11 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
                             traj_dir=PREDS_DIR / config.experiment_id / condition / "trajectories",
                         )
                         patch = run_meta.get("patch", "")
+                        patch, patch_is_noop = sanitize_patch_for_preds(patch)
+                        print(
+                            f"  [{condition}] {iid} patch sanitation: "
+                            f"sanitized_patch_len={len(patch)}, no_op={patch_is_noop}"
+                        )
                 except Exception as exc:
                     print(f"  Eval error {iid}: {exc}", file=sys.stderr)
                     patch = ""

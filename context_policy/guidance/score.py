@@ -16,6 +16,7 @@ from context_policy.guidance.schema import RepoGuidance
 from context_policy.runner.mini_swe_agent_swebench import (
     generate_patch_with_mini_swebench_result,
 )
+from context_policy.runner.patch_utils import sanitize_patch_for_preds
 from context_policy.utils.paths import PREDS_DIR
 
 
@@ -169,6 +170,11 @@ def score_candidate_detailed(
                     traj_dir=preds_dir / "trajectories",
                 )
                 patch = result.get("patch", "")
+                patch, patch_is_noop = sanitize_patch_for_preds(patch)
+                print(
+                    f"  [score] {iid} patch sanitation: "
+                    f"sanitized_patch_len={len(patch)}, no_op={patch_is_noop}"
+                )
                 elapsed_s = float(result.get("elapsed_s", 0.0) or 0.0)
                 usage = result.get("token_usage", {}) if isinstance(result, dict) else {}
                 prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)

@@ -71,9 +71,15 @@ def diagnose_failures(
             )
 
     if not diagnostic_lines:
+        print("[oracle.diagnose] No diagnostic lines; returning no edits", flush=True)
         return []
 
     diagnostics_text = "\n".join(diagnostic_lines)
+    print(
+        f"[oracle.diagnose] Sending diagnostics: probes={len(results)} "
+        f"lines={len(diagnostic_lines)} chars={len(diagnostics_text)}",
+        flush=True,
+    )
 
     messages = [
         {"role": "system", "content": _DIAGNOSE_SYSTEM},
@@ -94,6 +100,8 @@ def diagnose_failures(
         timeout_s=timeout_s,
     )
 
+    print(f"[oracle.diagnose] Model response length={len(raw)} chars", flush=True)
+
     return _parse_edits(raw)
 
 
@@ -106,18 +114,20 @@ def _parse_edits(raw: str) -> list[Edit]:
     try:
         arr = json.loads(text)
     except json.JSONDecodeError:
+        print("[oracle.diagnose] Primary JSON parse failed; attempting array extraction", flush=True)
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if match:
             try:
                 arr = json.loads(match.group())
             except json.JSONDecodeError:
-                print("  [diagnose] Failed to parse edits from LLM output")
+                print("[oracle.diagnose] Failed to parse edits from LLM output", flush=True)
                 return []
         else:
-            print("  [diagnose] No JSON array found in LLM output")
+            print("[oracle.diagnose] No JSON array found in LLM output", flush=True)
             return []
 
     if not isinstance(arr, list):
+        print("[oracle.diagnose] Parsed payload is not a list", flush=True)
         return []
 
     valid_actions = {"add", "modify", "strengthen", "remove"}
@@ -134,4 +144,5 @@ def _parse_edits(raw: str) -> list[Edit]:
             action = "add"
         edits.append(Edit(section=section, action=action, content=content))
 
+    print(f"[oracle.diagnose] Parsed edits={len(edits)}", flush=True)
     return edits

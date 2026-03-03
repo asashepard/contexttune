@@ -17,11 +17,11 @@ for a coding assistant working on a repository.
 
 Return ONLY a JSON array of probe objects with this shape:
 [
-  {
+    {{
     "task": "short realistic coding-assistant user request",
     "expected_behaviors": ["behavior 1", "behavior 2"],
     "rationale": "why this probe is useful"
-  }
+    }}
 ]
 
 Rules:
@@ -88,6 +88,11 @@ def generate_probes(
     max_probes: int = MAX_PROBES_PER_ROUND,
 ) -> list[Probe]:
     """Generate probes via LLM, unconstrained by fixed categories."""
+    print(
+        f"[oracle.probes] Generating probes: prior={len(prior_probes or [])} "
+        f"max={max_probes} agents_md_chars={len(agents_md)}",
+        flush=True,
+    )
     prior_probes = prior_probes or []
     prior_tasks = "\n".join(f"- {p.task}" for p in prior_probes)
     if not prior_tasks:
@@ -118,6 +123,7 @@ def generate_probes(
         max_tokens=2048,
         timeout_s=timeout_s,
     )
+    print(f"[oracle.probes] Probe model response length={len(raw)} chars", flush=True)
 
     text = raw.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -126,15 +132,19 @@ def generate_probes(
     try:
         arr = json.loads(text)
     except json.JSONDecodeError:
+        print("[oracle.probes] Primary JSON parse failed; attempting array extraction", flush=True)
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if not match:
+            print("[oracle.probes] No JSON array found; using fallback probes", flush=True)
             return _fallback_probes(kb, max_probes)
         try:
             arr = json.loads(match.group())
         except json.JSONDecodeError:
+            print("[oracle.probes] Extracted array parse failed; using fallback probes", flush=True)
             return _fallback_probes(kb, max_probes)
 
     if not isinstance(arr, list):
+        print("[oracle.probes] Parsed payload is not a list; using fallback probes", flush=True)
         return _fallback_probes(kb, max_probes)
 
     seen_tasks = {p.task.strip() for p in prior_probes}
@@ -172,6 +182,13 @@ def generate_probes(
         seen_tasks.add(task)
 
     if not probes:
+        print("[oracle.probes] No usable probes parsed; using fallback probes", flush=True)
         return _fallback_probes(kb, max_probes)
+
+    print(
+        f"[oracle.probes] Parsed probes: generated={len(probes)} "
+        f"(from payload items={len(arr)})",
+        flush=True,
+    )
 
     return probes

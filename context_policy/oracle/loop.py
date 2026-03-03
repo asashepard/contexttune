@@ -14,6 +14,7 @@ Flow:
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +31,11 @@ from context_policy.oracle.schema import Edit, OracleConfig, OracleState, Probe,
 from context_policy.probes import run_all_probes
 
 
+def _olog(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [oracle] {msg}", flush=True)
+
+
 def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
     """Run the continuous LLM-driven oracle loop for one repository."""
     out = (
@@ -44,23 +50,35 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
     guidance_dir = out / "versions"
     guidance_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[oracle] Checking out {config.repo} @ {config.commit}...")
+    _olog(f"Starting oracle loop for repo={config.repo} commit={config.commit}")
+    _olog(f"Output dir: {out}")
+    _olog(f"Model: {config.model} | Iterations: {config.iterations} | Timeout: {config.timeout_s}s")
+    _olog(f"Checking out {config.repo} @ {config.commit}...")
+    t_checkout = time.perf_counter()
     repo_dir = checkout_repo(config.repo, config.commit)
+    _olog(f"Checkout complete in {time.perf_counter() - t_checkout:.2f}s at {repo_dir}")
 
-    print(f"[oracle] Running probes on {config.repo}...")
+    _olog(f"Running deterministic structural probes on {config.repo}...")
+    t_probes = time.perf_counter()
     probe_results = run_all_probes(repo_dir)
+    _olog(f"Structural probes complete in {time.perf_counter() - t_probes:.2f}s")
 
     _save_probe_results_summary(probe_results, kb_dir / "probes_summary.json")
+    _olog(f"Saved probe summary to {kb_dir / 'probes_summary.json'}")
 
+    t_kb = time.perf_counter()
     kb = build_kb(config.repo, config.commit, probe_results)
     kb.save(kb_dir / "kb.json")
-    print(
-        f"[oracle] KB built: arch={len(kb.architecture)} chars, "
+    _olog(
+        "KB built in "
+        f"{time.perf_counter() - t_kb:.2f}s: "
+        f"arch={len(kb.architecture)} chars, "
         f"map={len(kb.symbol_map)} chars, "
         f"ctx={len(kb.context)} chars, "
         f"conv={len(kb.conventions)} chars"
     )
 
+    t_render = time.perf_counter()
     agents_md = render_agents_md(kb)
     v0_guidance = RepoGuidance(
         repo=config.repo,
@@ -70,11 +88,15 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
     )
     v0_guidance.save(guidance_dir / "v0.json")
     (kb_dir / "agents_md_v0.md").write_text(agents_md, encoding="utf-8")
-    print(f"[oracle] Static AGENTS.md: {len(agents_md)} chars, {len(v0_guidance.lines)} lines")
+    _olog(
+        f"Static AGENTS.md built in {time.perf_counter() - t_render:.2f}s: "
+        f"{len(agents_md)} chars, {len(v0_guidance.lines)} lines"
+    )
 
     if config.iterations <= 0:
         final_path = out / "best_guidance.json"
         v0_guidance.save(final_path)
+        _olog(f"Iterations=0; wrote static guidance to {final_path}")
         return kb, v0_guidance
 
     if state_path.exists():
@@ -84,11 +106,12 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
             if current_path.exists():
                 current = RepoGuidance.load(current_path)
                 agents_md = current.render()
-                print(
-                    f"[oracle] Resuming from v{state.current_version} "
+                _olog(
+                    f"Resuming from v{state.current_version} "
                     f"(completed_iterations={state.completed_iterations})"
                 )
             else:
+                _olog("Resume state found but current version file missing; starting fresh state")
                 state = OracleState(repo=config.repo)
         else:
             state = OracleState(repo=config.repo)
@@ -105,8 +128,10 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
     probes: list[Probe] = []
     start_iter = state.completed_iterations + 1
     for t in range(start_iter, config.iterations + 1):
-        print(f"\n[oracle] {config.repo} iteration {t}/{config.iterations}")
+        iter_start = time.perf_counter()
+        _olog(f"Iteration {t}/{config.iterations} started for {config.repo}")
 
+        t_gen = time.perf_counter()
         new_probes = generate_probes(
             kb,
             config.model,
@@ -115,26 +140,42 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
             timeout_s=config.timeout_s,
         )
         probes.extend(new_probes)
-        print(
-            f"  Generated {len(new_probes)} new probes; "
-            f"total probe pool={len(probes)}"
+        _olog(
+            f"Probe generation complete in {time.perf_counter() - t_gen:.2f}s: "
+            f"new={len(new_probes)}, pool={len(probes)}"
         )
 
+        t_eval = time.perf_counter()
         results = _evaluate_all_probes_detailed(agents_md, probes, config)
+        _olog(f"Probe evaluation finished in {time.perf_counter() - t_eval:.2f}s")
 
+        t_diag = time.perf_counter()
         llm_edits = diagnose_failures(agents_md, results, config.model, timeout_s=config.timeout_s)
+        _olog(f"Diagnose stage complete in {time.perf_counter() - t_diag:.2f}s: edits={len(llm_edits)}")
         direct_edits = _collect_edits_from_results(results)
         edits = _dedupe_edits([*direct_edits, *llm_edits])
 
-        print(
-            f"  Proposed edits: direct={len(direct_edits)}, "
+        _olog(
+            f"Proposed edits summary: direct={len(direct_edits)}, "
             f"diagnose={len(llm_edits)}, merged={len(edits)}"
         )
+        if edits:
+            preview = "; ".join(
+                f"{e.action}@{e.section}" for e in edits[:5]
+            )
+            if len(edits) > 5:
+                preview += f"; ... (+{len(edits) - 5} more)"
+            _olog(f"Edit preview: {preview}")
 
         if edits:
+            t_apply = time.perf_counter()
             agents_md = apply_edits(agents_md, edits, config.model, timeout_s=config.timeout_s)
+            _olog(
+                f"Apply stage complete in {time.perf_counter() - t_apply:.2f}s; "
+                f"updated AGENTS.md length={len(agents_md)} chars"
+            )
         else:
-            print("  No valid edits returned; preserving AGENTS.md for this iteration")
+            _olog("No valid edits returned; preserving AGENTS.md for this iteration")
 
         new_version = current.version + 1
         current = RepoGuidance(
@@ -163,12 +204,15 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
         )
         state.save(state_path)
 
-        print(f"  Saved v{new_version} ({len(agents_md)} chars)")
+        _olog(
+            f"Iteration {t} complete in {time.perf_counter() - iter_start:.2f}s; "
+            f"saved v{new_version} ({len(agents_md)} chars)"
+        )
 
     final_path = out / "best_guidance.json"
     current.save(final_path)
-    print(f"\n[oracle] Done. Final for {config.repo}: v{current.version}")
-    print(f"  Saved to {final_path}")
+    _olog(f"Done. Final for {config.repo}: v{current.version}")
+    _olog(f"Saved final guidance to {final_path}")
 
     config_path = out / "oracle_config.json"
     config_path.write_text(
@@ -186,7 +230,11 @@ def _evaluate_all_probes_detailed(
     """Evaluate all probes and return detailed results."""
     results: list[ProbeResult] = []
     for i, probe in enumerate(probes):
-        print(f"    Evaluating probe {i+1}/{len(probes)}: {probe.id}...")
+        _olog(
+            f"Probe {i+1}/{len(probes)} start id={probe.id} "
+            f"task_len={len(probe.task)} behaviors={len(probe.expected_behaviors)}"
+        )
+        t_probe = time.perf_counter()
         try:
             result = evaluate_probe(
                 agents_md, probe, config.model, timeout_s=config.timeout_s,
@@ -194,13 +242,15 @@ def _evaluate_all_probes_detailed(
             results.append(result)
             missing = sum(1 for r in result.behavior_reviews if r.assessment == "missing")
             partial = sum(1 for r in result.behavior_reviews if r.assessment == "partial")
-            print(
-                f"      → reviews={len(result.behavior_reviews)} "
-                f"(missing={missing}, partial={partial}), "
+            strong = sum(1 for r in result.behavior_reviews if r.assessment == "strong")
+            _olog(
+                f"Probe {i+1}/{len(probes)} done in {time.perf_counter() - t_probe:.2f}s: "
+                f"reviews={len(result.behavior_reviews)} "
+                f"(strong={strong}, partial={partial}, missing={missing}), "
                 f"edits={len(result.proposed_edits)}"
             )
         except Exception as exc:
-            print(f"      → ERROR: {exc}")
+            _olog(f"Probe {i+1}/{len(probes)} ERROR after {time.perf_counter() - t_probe:.2f}s: {exc}")
             results.append(
                 ProbeResult(
                     probe_id=probe.id,
@@ -218,6 +268,7 @@ def _collect_edits_from_results(results: list[ProbeResult]) -> list[Edit]:
     edits: list[Edit] = []
     for result in results:
         edits.extend(result.proposed_edits)
+    _olog(f"Collected {len(edits)} direct edits from {len(results)} probe results")
     return edits
 
 
@@ -238,6 +289,7 @@ def _dedupe_edits(edits: list[Edit]) -> list[Edit]:
                 content=key[2],
             )
         )
+    _olog(f"Deduped edits: input={len(edits)} output={len(out)}")
     return out
 
 

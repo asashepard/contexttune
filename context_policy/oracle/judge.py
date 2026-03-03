@@ -89,13 +89,20 @@ def simulate_response(
         {"role": "system", "content": system},
         {"role": "user", "content": probe.task},
     ]
-    return chat_completion(
+    print(
+        f"[oracle.judge] simulate_response: task_chars={len(probe.task)} "
+        f"agents_md_chars={len(agents_md)}",
+        flush=True,
+    )
+    response = chat_completion(
         model=model,
         messages=messages,
         temperature=0.3,
         max_tokens=1024,
         timeout_s=timeout_s,
     )
+    print(f"[oracle.judge] simulate_response: response_chars={len(response)}", flush=True)
+    return response
 
 
 def review_probe(
@@ -133,6 +140,11 @@ def review_probe(
         },
     ]
 
+    print(
+        f"[oracle.judge] review_probe: behaviors={len(expected_behaviors)} "
+        f"response_chars={len(response)}",
+        flush=True,
+    )
     raw = chat_completion(
         model=model,
         messages=messages,
@@ -140,6 +152,7 @@ def review_probe(
         max_tokens=2048,
         timeout_s=timeout_s,
     )
+    print(f"[oracle.judge] review_probe: raw_chars={len(raw)}", flush=True)
 
     return _parse_review(raw, expected_behaviors)
 
@@ -156,16 +169,20 @@ def _parse_review(
     try:
         obj = json.loads(text)
     except json.JSONDecodeError:
+        print("[oracle.judge] review parse failed; attempting object extraction", flush=True)
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
                 obj = json.loads(match.group())
             except json.JSONDecodeError:
+                print("[oracle.judge] extracted object parse failed; using fallback review", flush=True)
                 return _fallback_reviews(expected_behaviors)
         else:
+            print("[oracle.judge] no JSON object found; using fallback review", flush=True)
             return _fallback_reviews(expected_behaviors)
 
     if not isinstance(obj, dict):
+        print("[oracle.judge] parsed payload is not dict; using fallback review", flush=True)
         return _fallback_reviews(expected_behaviors)
 
     reviews_raw = obj.get("behavior_reviews", [])
@@ -208,6 +225,10 @@ def _parse_review(
             action = "add"
         edits.append(Edit(section=section, action=action, content=content))
 
+    print(
+        f"[oracle.judge] review parsed: reviews={len(reviews)} edits={len(edits)}",
+        flush=True,
+    )
     return reviews, edits, overall_notes
 
 

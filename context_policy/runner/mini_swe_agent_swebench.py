@@ -31,7 +31,8 @@ from context_policy.runner.patch_utils import (
 DEFAULT_MAX_STEPS = 30
 DEFAULT_AGENT_MAX_TOKENS = 1024
 DEFAULT_CONTEXT_WINDOW_TOKENS = 32768
-DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS = 256
+DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS = 512
+DEFAULT_CONTEXT_BOUNDARY_BUFFER_TOKENS = 32
 
 
 def _first_nonempty_env(*keys: str) -> str | None:
@@ -107,33 +108,56 @@ def _trim_context_for_token_budget(
     max_output_tokens: int,
     context_window_tokens: int,
     safety_margin_tokens: int = DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
-) -> tuple[str, str | None, int, bool]:
+) -> tuple[str, str | None, int, bool, int, int]:
     """Trim context block so prompt leaves room for output tokens.
 
     Returns:
-      (task, trimmed_context, estimated_prompt_tokens, was_trimmed)
+      (task, trimmed_context, estimated_prompt_tokens, was_trimmed,
+       max_input_budget_tokens, trimmed_chars)
     """
     if not context_md:
         task = build_task_with_context(problem_statement, None)
-        return task, None, _estimate_tokens(task), False
+        max_input_budget_tokens = max(
+            1,
+            context_window_tokens
+            - max_output_tokens
+            - safety_margin_tokens
+            - DEFAULT_CONTEXT_BOUNDARY_BUFFER_TOKENS,
+        )
+        return task, None, _estimate_tokens(task), False, max_input_budget_tokens, 0
 
     task_with_context = build_task_with_context(problem_statement, context_md)
     estimated_prompt_tokens = _estimate_tokens(task_with_context)
-    allowed_prompt_tokens = max(1, context_window_tokens - max_output_tokens - safety_margin_tokens)
-    if estimated_prompt_tokens <= allowed_prompt_tokens:
-        return task_with_context, context_md, estimated_prompt_tokens, False
+    max_input_budget_tokens = max(
+        1,
+        context_window_tokens
+        - max_output_tokens
+        - safety_margin_tokens
+        - DEFAULT_CONTEXT_BOUNDARY_BUFFER_TOKENS,
+    )
+    if estimated_prompt_tokens <= max_input_budget_tokens:
+        return task_with_context, context_md, estimated_prompt_tokens, False, max_input_budget_tokens, 0
 
     base_task = build_task_with_context(problem_statement, None)
     base_tokens = _estimate_tokens(base_task)
-    if base_tokens >= allowed_prompt_tokens:
+    if base_tokens >= max_input_budget_tokens:
         # Even without context we're near/over budget; drop context entirely.
-        return base_task, None, base_tokens, True
+        trimmed_chars = len(context_md)
+        return base_task, None, base_tokens, True, max_input_budget_tokens, trimmed_chars
 
-    remaining_for_context_tokens = max(0, allowed_prompt_tokens - base_tokens)
+    remaining_for_context_tokens = max(0, max_input_budget_tokens - base_tokens)
     remaining_for_context_chars = max(0, remaining_for_context_tokens * 4)
     trimmed_context = context_md[:remaining_for_context_chars]
     trimmed_task = build_task_with_context(problem_statement, trimmed_context)
-    return trimmed_task, trimmed_context, _estimate_tokens(trimmed_task), True
+    trimmed_chars = max(0, len(context_md) - len(trimmed_context))
+    return (
+        trimmed_task,
+        trimmed_context,
+        _estimate_tokens(trimmed_task),
+        True,
+        max_input_budget_tokens,
+        trimmed_chars,
+    )
 
 
 def _sum_int(v: Any) -> int:
@@ -729,7 +753,7 @@ def generate_patch_with_mini_swebench_result(
             pass
 
     context_window_tokens = _resolve_context_window_tokens()
-    task, trimmed_context, est_prompt_tokens, was_trimmed = _trim_context_for_token_budget(
+    task, trimmed_context, est_prompt_tokens, was_trimmed, max_input_budget_tokens, trimmed_chars = _trim_context_for_token_budget(
         problem_statement,
         context_md,
         max_output_tokens=desired_max_tokens,
@@ -742,13 +766,21 @@ def generate_patch_with_mini_swebench_result(
             "  Context budget trim applied: "
             f"before={before_chars} chars, after={after_chars} chars, "
             f"est_prompt_tokens={est_prompt_tokens}, max_tokens={desired_max_tokens}, "
-            f"context_window_tokens={context_window_tokens}"
+            f"context_window_tokens={context_window_tokens}, "
+            f"safety_margin_tokens={DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS}, "
+            f"boundary_buffer_tokens={DEFAULT_CONTEXT_BOUNDARY_BUFFER_TOKENS}, "
+            f"max_input_budget={max_input_budget_tokens}, "
+            f"trimmed_chars={trimmed_chars}"
         )
     else:
         print(
             "  Context budget check: "
             f"est_prompt_tokens={est_prompt_tokens}, max_tokens={desired_max_tokens}, "
-            f"context_window_tokens={context_window_tokens}"
+            f"context_window_tokens={context_window_tokens}, "
+            f"safety_margin_tokens={DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS}, "
+            f"boundary_buffer_tokens={DEFAULT_CONTEXT_BOUNDARY_BUFFER_TOKENS}, "
+            f"max_input_budget={max_input_budget_tokens}, "
+            f"trimmed_chars={trimmed_chars}"
         )
 
     # Create trajectory file path

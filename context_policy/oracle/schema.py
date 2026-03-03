@@ -8,31 +8,34 @@ from pathlib import Path
 
 @dataclass
 class Probe:
-    """A micro-test probe generated from the KB."""
+    """A micro-test probe generated for AGENTS.md stress-testing."""
 
     id: str
-    category: str  # "hub-safety", "entry-point", "naming", "architecture", "harvested"
-    task: str  # the user prompt to send
+    task: str
     expected_behaviors: list[str] = field(default_factory=list)
+    rationale: str = ""
 
 
 @dataclass
-class BehaviorVerdict:
-    """Result of judging one expected behavior against a response."""
+class BehaviorReview:
+    """Diagnostic review of one expected behavior."""
 
     behavior: str
-    passed: bool
-    reasoning: str = ""
+    assessment: str  # strong|partial|missing
+    evidence: str = ""
+    improvement: str = ""
 
 
 @dataclass
 class ProbeResult:
-    """Result of evaluating one probe."""
+    """Diagnostic result of evaluating one probe."""
 
     probe_id: str
-    category: str
-    verdicts: list[BehaviorVerdict] = field(default_factory=list)
-    pass_rate: float = 0.0
+    task: str
+    response: str
+    behavior_reviews: list[BehaviorReview] = field(default_factory=list)
+    proposed_edits: list[Edit] = field(default_factory=list)
+    overall_notes: str = ""
 
 
 @dataclass
@@ -64,8 +67,7 @@ class OracleState:
     """Persistent state for the oracle evaluator loop."""
 
     repo: str
-    best_version: int = 0
-    best_pass_rate: float = 0.0
+    current_version: int = 0
     completed_iterations: int = 0
     history: list[dict] = field(default_factory=list)
 
@@ -76,8 +78,7 @@ class OracleState:
     def from_dict(cls, d: dict) -> OracleState:
         return cls(
             repo=d["repo"],
-            best_version=d.get("best_version", 0),
-            best_pass_rate=d.get("best_pass_rate", 0.0),
+            current_version=d.get("current_version", 0),
             completed_iterations=d.get("completed_iterations", 0),
             history=list(d.get("history", [])),
         )

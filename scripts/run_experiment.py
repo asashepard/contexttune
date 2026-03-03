@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -33,6 +34,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from context_policy.loop.orchestrator import ExperimentConfig, VALID_CONDITIONS, run_experiment
 from context_policy.utils.run_id import make_run_id
+
+
+def _resolve_oracle_model(agent_model: str) -> str:
+    """Resolve OpenAI-compatible model ID for oracle/direct calls.
+
+    Priority:
+    1) MODEL_NAME_OPENAI env var
+    2) Strip leading hosted_vllm/ from agent model
+    3) Fallback to agent model unchanged
+    """
+    explicit = os.environ.get("MODEL_NAME_OPENAI", "").strip()
+    if explicit:
+        return explicit
+
+    prefix = "hosted_vllm/"
+    if agent_model.startswith(prefix):
+        stripped = agent_model[len(prefix):].strip()
+        if stripped:
+            return stripped
+
+    return agent_model
 
 
 def main() -> None:
@@ -77,6 +99,8 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    oracle_model = _resolve_oracle_model(args.model)
+
     # Load repo config
     repo_config_path = Path(args.repo_config)
     if not repo_config_path.exists():
@@ -88,6 +112,7 @@ def main() -> None:
     config = ExperimentConfig(
         experiment_id=experiment_id,
         model=args.model,
+        oracle_model=oracle_model,
         repos=repos,
         conditions=list(args.conditions),
         oracle_iterations=args.oracle_iterations,
@@ -100,7 +125,7 @@ def main() -> None:
     )
 
     print(f"Experiment: {experiment_id}")
-    print(f"Model: {args.model}")
+    print(f"Model names: agent={args.model} | oracle_openai={oracle_model}")
     print(f"Repos: {len(repos)}")
     print(f"Conditions: {args.conditions}")
     print(f"Oracle iterations: {args.oracle_iterations}")

@@ -1,180 +1,177 @@
-"""Micro-test probe generation from RepoKB sections.
-
-Parses KB sections to extract hubs, entry points, and conventions,
-then generates probes with expected behaviors.  Each probe has an ID,
-category, task (user prompt), and list of expected behaviors.
-
-Probe categories:
-- hub-safety: from architecture hubs
-- entry-point: from architecture entries
-- naming: from map conventions
-- architecture: from KB structure / changed files
-- harvested: from real prompts if available
-
-Capped at 10 total probes, deduplicated by ID.
-"""
+"""LLM-generated probe generation for continuous AGENTS.md tuning."""
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 
 from context_policy.kb.schema import RepoKB
+from context_policy.llm.openai_compat import chat_completion
 from context_policy.oracle.schema import Probe
 
-MAX_PROBES = 10
+MAX_PROBES_PER_ROUND = 10
+
+_PROBE_SYSTEM = """\
+You are generating probe tasks to stress-test and improve AGENTS.md guidance
+for a coding assistant working on a repository.
+
+Return ONLY a JSON array of probe objects with this shape:
+[
+  {
+    "task": "short realistic coding-assistant user request",
+    "expected_behaviors": ["behavior 1", "behavior 2"],
+    "rationale": "why this probe is useful"
+  }
+]
+
+Rules:
+- Generate diverse probes (architecture, testing, code navigation, change safety).
+- Prefer concrete repo-aware tasks over generic style prompts.
+- Avoid duplicates with prior probe tasks.
+- Provide 2-4 expected behaviors per probe.
+- Maximum {max_probes} probes.
+"""
+
+_PROBE_USER = """\
+Repository: {repo} @ {commit}
+
+CURRENT AGENTS.MD:
+---
+{agents_md}
+---
+
+REPO KB SNIPPET:
+---
+{kb_text}
+---
+
+PRIOR PROBE TASKS (avoid duplicates):
+{prior_tasks}
+
+Generate probes now."""
 
 
-def _make_id(category: str, *parts: str) -> str:
-    """Generate a short deterministic probe ID."""
-    raw = f"{category}:{'|'.join(parts)}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:10]
+def _make_probe_id(task: str) -> str:
+    return hashlib.sha256(task.encode("utf-8")).hexdigest()[:10]
 
 
-def _extract_hub_files(kb: RepoKB) -> list[tuple[str, str, str]]:
-    """Extract (file, in_degree, importers) tuples from architecture."""
-    results: list[tuple[str, str, str]] = []
-    for line in kb.architecture.splitlines():
-        if not line.startswith("|"):
-            continue
-        parts = [p.strip() for p in line.split("|") if p.strip()]
-        if len(parts) >= 3 and parts[0] != "File" and "---" not in parts[0]:
-            results.append((parts[0], parts[1], parts[2]))
-    return results
-
-
-def _extract_entry_points_from_kb(kb: RepoKB) -> list[tuple[str, str, str]]:
-    """Extract (file, kind, classification) from architecture."""
-    results: list[tuple[str, str, str]] = []
-    in_ep = False
-    for line in kb.architecture.splitlines():
-        if "Entry Points" in line:
-            in_ep = True
-            continue
-        if in_ep and line.startswith("#"):
-            break
-        if in_ep and line.startswith("|"):
-            parts = [p.strip() for p in line.split("|") if p.strip()]
-            if len(parts) >= 3 and parts[0] != "File" and "---" not in parts[0]:
-                results.append((parts[0], parts[1], parts[2]))
-    return results
-
-
-def _extract_convention_items(kb: RepoKB) -> list[str]:
-    """Extract convention bullet points."""
-    items: list[str] = []
-    for line in kb.conventions.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- "):
-            items.append(stripped[2:])
-    return items
-
-
-def generate_probes(kb: RepoKB) -> list[Probe]:
-    """Generate micro-test probes from the KB.
-
-    Args:
-        kb: The RepoKB artifact to derive probes from.
-
-    Returns:
-        List of ``Probe`` objects, capped at 10 and deduplicated by ID.
-    """
+def _fallback_probes(kb: RepoKB, limit: int) -> list[Probe]:
+    tasks = [
+        f"I need to make a risky change in {kb.repo}. What files and tests should I check first?",
+        f"I am adding a new feature in {kb.repo}. What repo-specific conventions should I follow?",
+        f"I changed a core module in {kb.repo}. How should I validate blast radius before submission?",
+    ]
     probes: list[Probe] = []
-    seen_ids: set[str] = set()
-
-    def _add(probe: Probe) -> None:
-        if probe.id not in seen_ids and len(probes) < MAX_PROBES:
-            seen_ids.add(probe.id)
-            probes.append(probe)
-
-    # ── hub-safety probes ─────────────────────────────────────
-    hubs = _extract_hub_files(kb)
-    for file, in_degree, importers in hubs[:3]:
-        pid = _make_id("hub-safety", file)
-        _add(Probe(
-            id=pid,
-            category="hub-safety",
-            task=(
-                f"I need to modify `{file}` to change its behavior. "
-                f"What other files should I update or check, and what "
-                f"tests should I run?"
-            ),
-            expected_behaviors=[
-                f"Mentions at least one of the importing files: {importers}",
-                "Recommends running relevant tests",
-                f"Acknowledges that {file} is a hub with many dependents",
-            ],
-        ))
-
-    # ── entry-point probes ────────────────────────────────────
-    eps = _extract_entry_points_from_kb(kb)
-    for file, kind, classification in eps[:2]:
-        pid = _make_id("entry-point", file)
-        _add(Probe(
-            id=pid,
-            category="entry-point",
-            task=(
-                f"I want to add a new {kind} endpoint similar to "
-                f"those in `{file}`. What patterns should I follow?"
-            ),
-            expected_behaviors=[
-                f"References the existing {kind} pattern in {file}",
-                "Describes the correct decorator or registration pattern",
-                "Mentions where to add associated tests",
-            ],
-        ))
-
-    # ── naming probes ─────────────────────────────────────────
-    conventions = _extract_convention_items(kb)
-    for conv in conventions[:2]:
-        if "docstring" in conv.lower() or "naming" in conv.lower() or "style" in conv.lower():
-            pid = _make_id("naming", conv)
-            _add(Probe(
-                id=pid,
-                category="naming",
-                task=(
-                    f"I'm creating a new module in this repository. "
-                    f"Given the convention: '{conv}', what naming "
-                    f"pattern should I follow?"
-                ),
+    for task in tasks[:limit]:
+        probes.append(
+            Probe(
+                id=_make_probe_id(task),
+                task=task,
                 expected_behaviors=[
-                    f"References the convention: {conv}",
-                    "Provides a concrete naming example",
+                    "Identifies impacted files or integration points",
+                    "Recommends concrete validation/test steps",
+                    "Uses repository-specific guidance from AGENTS.md",
                 ],
-            ))
+                rationale="Fallback probe due to generation parse/error.",
+            )
+        )
+    return probes
 
-    # ── architecture probes ───────────────────────────────────
-    # General architecture probe based on overall KB structure
-    if kb.architecture:
-        pid = _make_id("architecture", kb.repo)
-        _add(Probe(
-            id=pid,
-            category="architecture",
-            task=(
-                f"I need to fix a bug that changes the behavior of a "
-                f"core component in {kb.repo}. How should I scope my "
-                f"changes to minimize blast radius?"
-            ),
-            expected_behaviors=[
-                "Identifies hub files that should not be refactored carelessly",
-                "Suggests checking integration points",
-                "Recommends targeted test runs rather than the full suite",
-            ],
-        ))
 
-    # Additional architecture probe for test command/infrastructure
-    if kb.context:
-        pid = _make_id("architecture", "testing")
-        _add(Probe(
-            id=pid,
-            category="architecture",
-            task=(
-                f"I've just made a change to {kb.repo}. "
-                f"How do I verify it works correctly?"
+def generate_probes(
+    kb: RepoKB,
+    model: str,
+    agents_md: str,
+    *,
+    prior_probes: list[Probe] | None = None,
+    timeout_s: int = 120,
+    max_probes: int = MAX_PROBES_PER_ROUND,
+) -> list[Probe]:
+    """Generate probes via LLM, unconstrained by fixed categories."""
+    prior_probes = prior_probes or []
+    prior_tasks = "\n".join(f"- {p.task}" for p in prior_probes)
+    if not prior_tasks:
+        prior_tasks = "- (none)"
+
+    kb_text = kb.render_truncated(char_budget=12_000)
+    messages = [
+        {
+            "role": "system",
+            "content": _PROBE_SYSTEM.format(max_probes=max_probes),
+        },
+        {
+            "role": "user",
+            "content": _PROBE_USER.format(
+                repo=kb.repo,
+                commit=kb.commit,
+                agents_md=agents_md,
+                kb_text=kb_text,
+                prior_tasks=prior_tasks,
             ),
-            expected_behaviors=[
-                "Mentions the correct test command",
-                "References test directories or conftest files",
-            ],
-        ))
+        },
+    ]
+
+    raw = chat_completion(
+        model=model,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=2048,
+        timeout_s=timeout_s,
+    )
+
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        arr = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return _fallback_probes(kb, max_probes)
+        try:
+            arr = json.loads(match.group())
+        except json.JSONDecodeError:
+            return _fallback_probes(kb, max_probes)
+
+    if not isinstance(arr, list):
+        return _fallback_probes(kb, max_probes)
+
+    seen_tasks = {p.task.strip() for p in prior_probes}
+    probes: list[Probe] = []
+    for item in arr:
+        if len(probes) >= max_probes:
+            break
+        if not isinstance(item, dict):
+            continue
+
+        task = str(item.get("task", "")).strip()
+        if not task or task in seen_tasks:
+            continue
+
+        expected_behaviors = item.get("expected_behaviors", [])
+        if not isinstance(expected_behaviors, list):
+            expected_behaviors = []
+        expected_behaviors = [str(b).strip() for b in expected_behaviors if str(b).strip()]
+
+        if not expected_behaviors:
+            expected_behaviors = [
+                "Response reflects AGENTS.md repository guidance",
+                "Response includes actionable implementation/testing advice",
+            ]
+
+        rationale = str(item.get("rationale", "")).strip()
+        probes.append(
+            Probe(
+                id=_make_probe_id(task),
+                task=task,
+                expected_behaviors=expected_behaviors[:4],
+                rationale=rationale,
+            )
+        )
+        seen_tasks.add(task)
+
+    if not probes:
+        return _fallback_probes(kb, max_probes)
 
     return probes

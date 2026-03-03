@@ -39,6 +39,7 @@ class ExperimentConfig:
     experiment_id: str
     model: str
     repos: list[dict]  # each: {"repo": str, "commit": str}
+    oracle_model: str | None = None
 
     # Conditions to evaluate
     conditions: list[str] = field(default_factory=lambda: list(VALID_CONDITIONS))
@@ -196,7 +197,7 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
             oc = OracleConfig(
                 repo=repo,
                 commit=commit,
-                model=config.model,
+                model=config.oracle_model or config.model,
                 iterations=oracle_iters,
                 timeout_s=config.timeout_s,
                 output_dir=out_dir,

@@ -1,8 +1,4 @@
-"""Failure diagnosis — proposes structured edits to AGENTS.md.
-
-Collects all failing verdicts, sends them with current AGENTS.md to
-the LLM, and gets back structured edit proposals (section, action, content).
-"""
+"""Diagnostics aggregation — proposes structured edits to AGENTS.md."""
 from __future__ import annotations
 
 import json
@@ -12,15 +8,9 @@ from context_policy.llm.openai_compat import chat_completion
 from context_policy.oracle.schema import Edit, ProbeResult
 
 _DIAGNOSE_SYSTEM = """\
-You are an expert at diagnosing why a coding assistant's AGENTS.md
-instructions failed to guide correct behavior.  You will be given:
-
-1. The current AGENTS.md content.
-2. A list of probe failures — each describing a task, an expected
-   behavior, and the assistant's reasoning for why it was rated FAIL.
-
-Your job is to propose TARGETED edits to AGENTS.md that would fix
-the failures without breaking things that already work.
+You are an expert AGENTS.md editor. You will be given the current AGENTS.md
+and diagnostic probe outcomes. Your goal is to improve future assistant
+behavior by proposing targeted edits.
 
 Output a JSON array of edit objects, each with:
 - "section": which AGENTS.md section to edit (e.g. "Hub Safety", "Testing", "Conventions", or "new")
@@ -29,8 +19,7 @@ Output a JSON array of edit objects, each with:
 
 Rules:
 - Be specific and actionable.  Don't add vague platitudes.
-- Prefer "strengthen" over "add" when a rule exists but is too weak.
-- Prefer "modify" over "remove" + "add" when refining existing text.
+- Prefer "strengthen" or "modify" over adding duplicate rules.
 - Keep the total AGENTS.md under 3,200 characters.
 - Output ONLY the JSON array."""
 
@@ -40,45 +29,51 @@ CURRENT AGENTS.MD:
 {agents_md}
 ---
 
-PROBE FAILURES:
-{failures}
+PROBE DIAGNOSTICS:
+{diagnostics}
 
-Propose edits to fix these failures."""
+Propose edits to improve AGENTS.md for future iterations."""
 
 
 def diagnose_failures(
     agents_md: str,
-    failures: list[ProbeResult],
+    results: list[ProbeResult],
     model: str,
     *,
     timeout_s: int = 120,
 ) -> list[Edit]:
-    """Diagnose probe failures and propose AGENTS.md edits.
+    """Aggregate probe diagnostics and propose AGENTS.md edits.
 
     Args:
         agents_md: Current AGENTS.md content.
-        failures: List of ProbeResults that have at least one FAIL verdict.
+        results: ProbeResults from current iteration.
         model: LLM model name.
         timeout_s: LLM call timeout.
 
     Returns:
         List of structured ``Edit`` proposals.
     """
-    # Build failure summary
-    failure_lines: list[str] = []
-    for pr in failures:
-        for v in pr.verdicts:
-            if not v.passed:
-                failure_lines.append(
-                    f"- [{pr.category}] Probe {pr.probe_id}: "
-                    f"Expected: {v.behavior} — "
-                    f"Reasoning: {v.reasoning}"
-                )
+    diagnostic_lines: list[str] = []
+    for pr in results:
+        diagnostic_lines.append(f"- Probe {pr.probe_id}: {pr.task}")
+        for review in pr.behavior_reviews:
+            diagnostic_lines.append(
+                f"  * Behavior: {review.behavior} | "
+                f"Assessment: {review.assessment} | "
+                f"Evidence: {review.evidence} | "
+                f"Improvement: {review.improvement}"
+            )
+        if pr.overall_notes:
+            diagnostic_lines.append(f"  * Overall: {pr.overall_notes}")
+        for edit in pr.proposed_edits:
+            diagnostic_lines.append(
+                f"  * ProposedEdit: {edit.action}@{edit.section}: {edit.content}"
+            )
 
-    if not failure_lines:
+    if not diagnostic_lines:
         return []
 
-    failures_text = "\n".join(failure_lines)
+    diagnostics_text = "\n".join(diagnostic_lines)
 
     messages = [
         {"role": "system", "content": _DIAGNOSE_SYSTEM},
@@ -86,7 +81,7 @@ def diagnose_failures(
             "role": "user",
             "content": _DIAGNOSE_USER.format(
                 agents_md=agents_md,
-                failures=failures_text,
+                diagnostics=diagnostics_text,
             ),
         },
     ]

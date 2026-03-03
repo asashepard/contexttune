@@ -1,17 +1,15 @@
-"""Oracle evaluator loop — replaces the SWE-Smith hill-climbing tuner.
+"""Continuous oracle tuning loop for AGENTS.md.
 
 Flow:
-1. Checkout repo, run probes → build RepoKB (deterministic).
-2. Render initial AGENTS.md from KB → RepoGuidance v0 (``static_kb``).
-3. Generate micro-test probes from KB.
-4. For T iterations:
-   a. Evaluate all probes against current AGENTS.md (simulate + judge).
-   b. Collect failures (probes with any FAIL verdict).
-   c. If no failures, stop early.
-   d. diagnose_failures() → structured edits.
-   e. apply_edits() → updated AGENTS.md.
-   f. Wrap into RepoGuidance v(N+1), save version.
-5. Save final best AGENTS.md + KB.
+1. Checkout repo, run deterministic probes, build RepoKB.
+2. Render initial AGENTS.md from KB -> RepoGuidance v0.
+3. For each iteration (fixed count):
+   a. Generate new probes via LLM (no fixed categories).
+   b. Evaluate probes for diagnostics and edit opportunities.
+   c. Aggregate/propose edits.
+   d. Apply edits to AGENTS.md.
+   e. Save new guidance version.
+4. Save latest guidance as best_guidance.json.
 """
 from __future__ import annotations
 
@@ -28,19 +26,12 @@ from context_policy.oracle.apply import apply_edits
 from context_policy.oracle.diagnose import diagnose_failures
 from context_policy.oracle.judge import evaluate_probe
 from context_policy.oracle.probes import generate_probes
-from context_policy.oracle.schema import OracleConfig, OracleState
+from context_policy.oracle.schema import Edit, OracleConfig, OracleState, Probe, ProbeResult
 from context_policy.probes import run_all_probes
 
 
 def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
-    """Run the full oracle evaluator loop for one repository.
-
-    Args:
-        config: Fully populated ``OracleConfig``.
-
-    Returns:
-        Tuple of (RepoKB, best RepoGuidance found).
-    """
+    """Run the continuous LLM-driven oracle loop for one repository."""
     out = (
         Path(config.output_dir) if config.output_dir
         else Path("artifacts/guidance") / config.repo.replace("/", "__")
@@ -53,14 +44,12 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
     guidance_dir = out / "versions"
     guidance_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Step 1: Checkout + probes + KB ─────────────────────────
     print(f"[oracle] Checking out {config.repo} @ {config.commit}...")
     repo_dir = checkout_repo(config.repo, config.commit)
 
     print(f"[oracle] Running probes on {config.repo}...")
     probe_results = run_all_probes(repo_dir)
 
-    # Save raw probe results
     _save_probe_results_summary(probe_results, kb_dir / "probes_summary.json")
 
     kb = build_kb(config.repo, config.commit, probe_results)
@@ -72,7 +61,6 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
         f"conv={len(kb.conventions)} chars"
     )
 
-    # ── Step 2: Initial AGENTS.md (static_kb) ─────────────────
     agents_md = render_agents_md(kb)
     v0_guidance = RepoGuidance(
         repo=config.repo,
@@ -81,31 +69,25 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
         version=0,
     )
     v0_guidance.save(guidance_dir / "v0.json")
-    # Also save as standalone AGENTS.md
     (kb_dir / "agents_md_v0.md").write_text(agents_md, encoding="utf-8")
     print(f"[oracle] Static AGENTS.md: {len(agents_md)} chars, {len(v0_guidance.lines)} lines")
 
-    # If iterations == 0, return the static KB result immediately
     if config.iterations <= 0:
         final_path = out / "best_guidance.json"
         v0_guidance.save(final_path)
         return kb, v0_guidance
 
-    # ── Step 3: Generate micro-test probes ─────────────────────
-    probes = generate_probes(kb)
-    print(f"[oracle] Generated {len(probes)} probes: "
-          f"{', '.join(p.category for p in probes)}")
-
-    # ── Resume support ─────────────────────────────────────────
     if state_path.exists():
         state = OracleState.load(state_path)
         if state.completed_iterations > 0:
-            best_path = guidance_dir / f"v{state.best_version}.json"
-            if best_path.exists():
-                best = RepoGuidance.load(best_path)
-                agents_md = best.render()
-                print(f"[oracle] Resuming from v{state.best_version} "
-                      f"(pass_rate={state.best_pass_rate:.1%})")
+            current_path = guidance_dir / f"v{state.current_version}.json"
+            if current_path.exists():
+                current = RepoGuidance.load(current_path)
+                agents_md = current.render()
+                print(
+                    f"[oracle] Resuming from v{state.current_version} "
+                    f"(completed_iterations={state.completed_iterations})"
+                )
             else:
                 state = OracleState(repo=config.repo)
         else:
@@ -113,151 +95,150 @@ def run_oracle_loop(config: OracleConfig) -> tuple[RepoKB, RepoGuidance]:
     else:
         state = OracleState(repo=config.repo)
 
-    # Score initial v0 if not already done
-    if not state.history:
-        v0_pass_rate = _evaluate_all_probes(agents_md, probes, config)
-        state.best_pass_rate = v0_pass_rate
-        state.history.append({
-            "version": 0,
-            "pass_rate": v0_pass_rate,
-            "type": "init",
-        })
-        state.save(state_path)
-        print(f"[oracle] v0 pass rate: {v0_pass_rate:.1%}")
+    current = RepoGuidance(
+        repo=config.repo,
+        commit=config.commit,
+        lines=agents_md.splitlines(),
+        version=state.current_version,
+    )
 
-    best = v0_guidance
-    best_pass_rate = state.best_pass_rate
-
-    # ── Step 4: Oracle iterations ──────────────────────────────
+    probes: list[Probe] = []
     start_iter = state.completed_iterations + 1
     for t in range(start_iter, config.iterations + 1):
         print(f"\n[oracle] {config.repo} iteration {t}/{config.iterations}")
-        print(f"  Current best: v{best.version} pass_rate={best_pass_rate:.1%}")
 
-        # 4a: Evaluate all probes
+        new_probes = generate_probes(
+            kb,
+            config.model,
+            agents_md,
+            prior_probes=probes,
+            timeout_s=config.timeout_s,
+        )
+        probes.extend(new_probes)
+        print(
+            f"  Generated {len(new_probes)} new probes; "
+            f"total probe pool={len(probes)}"
+        )
+
         results = _evaluate_all_probes_detailed(agents_md, probes, config)
 
-        # 4b: Collect failures
-        failures = [r for r in results if r.pass_rate < 1.0]
-        if not failures:
-            print(f"  All probes pass — stopping early at iteration {t}")
-            state.completed_iterations = t
-            state.save(state_path)
-            break
+        llm_edits = diagnose_failures(agents_md, results, config.model, timeout_s=config.timeout_s)
+        direct_edits = _collect_edits_from_results(results)
+        edits = _dedupe_edits([*direct_edits, *llm_edits])
 
-        fail_count = sum(
-            1 for r in results for v in r.verdicts if not v.passed
+        print(
+            f"  Proposed edits: direct={len(direct_edits)}, "
+            f"diagnose={len(llm_edits)}, merged={len(edits)}"
         )
-        total_behaviors = sum(len(r.verdicts) for r in results)
-        print(f"  Failures: {fail_count}/{total_behaviors} behaviors failed")
 
-        # 4c: Diagnose failures
-        edits = diagnose_failures(agents_md, failures, config.model, timeout_s=config.timeout_s)
-        if not edits:
-            print(f"  No edits proposed — skipping iteration {t}")
-            state.completed_iterations = t
-            state.save(state_path)
-            continue
-        print(f"  Proposed {len(edits)} edits: "
-              f"{', '.join(f'{e.action}@{e.section}' for e in edits)}")
+        if edits:
+            agents_md = apply_edits(agents_md, edits, config.model, timeout_s=config.timeout_s)
+        else:
+            print("  No valid edits returned; preserving AGENTS.md for this iteration")
 
-        # 4d: Apply edits
-        new_agents_md = apply_edits(agents_md, edits, config.model, timeout_s=config.timeout_s)
-
-        # 4e: Score new version
-        new_pass_rate = _evaluate_all_probes(new_agents_md, probes, config)
-        new_version = best.version + 1
-
-        new_guidance = RepoGuidance(
+        new_version = current.version + 1
+        current = RepoGuidance(
             repo=config.repo,
             commit=config.commit,
-            lines=new_agents_md.splitlines(),
+            lines=agents_md.splitlines(),
             version=new_version,
         )
-        new_guidance.save(guidance_dir / f"v{new_version}.json")
+        current.save(guidance_dir / f"v{new_version}.json")
 
-        state.history.append({
-            "version": new_version,
-            "pass_rate": new_pass_rate,
-            "type": "oracle_iteration",
-            "iteration": t,
-            "edits_count": len(edits),
-            "edits": [{"section": e.section, "action": e.action, "content": e.content} for e in edits],
-        })
-
-        if new_pass_rate >= best_pass_rate:
-            print(f"  ✓ v{new_version} improves: {best_pass_rate:.1%} → {new_pass_rate:.1%}")
-            best = new_guidance
-            best_pass_rate = new_pass_rate
-            agents_md = new_agents_md
-            state.best_version = new_version
-            state.best_pass_rate = new_pass_rate
-        else:
-            print(f"  ✗ v{new_version}: {new_pass_rate:.1%} < {best_pass_rate:.1%} (keeping current)")
-
+        state.current_version = new_version
         state.completed_iterations = t
+        state.history.append(
+            {
+                "version": new_version,
+                "type": "oracle_iteration",
+                "iteration": t,
+                "probe_pool_size": len(probes),
+                "new_probes": len(new_probes),
+                "edits_count": len(edits),
+                "edits": [
+                    {"section": e.section, "action": e.action, "content": e.content}
+                    for e in edits
+                ],
+            }
+        )
         state.save(state_path)
 
-    # ── Save final best ───────────────────────────────────────
+        print(f"  Saved v{new_version} ({len(agents_md)} chars)")
+
     final_path = out / "best_guidance.json"
-    best.save(final_path)
-    print(f"\n[oracle] Done. Best for {config.repo}: "
-          f"v{best.version} pass_rate={best_pass_rate:.1%}")
+    current.save(final_path)
+    print(f"\n[oracle] Done. Final for {config.repo}: v{current.version}")
     print(f"  Saved to {final_path}")
 
-    # Save config for reproducibility
     config_path = out / "oracle_config.json"
     config_path.write_text(
         json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8",
     )
 
-    return kb, best
-
-
-def _evaluate_all_probes(
-    agents_md: str,
-    probes: list,
-    config: OracleConfig,
-) -> float:
-    """Evaluate all probes and return aggregate pass rate."""
-    results = _evaluate_all_probes_detailed(agents_md, probes, config)
-    if not results:
-        return 0.0
-    total_passed = sum(
-        1 for r in results for v in r.verdicts if v.passed
-    )
-    total_behaviors = sum(len(r.verdicts) for r in results)
-    return total_passed / total_behaviors if total_behaviors > 0 else 0.0
+    return kb, current
 
 
 def _evaluate_all_probes_detailed(
     agents_md: str,
-    probes: list,
+    probes: list[Probe],
     config: OracleConfig,
-) -> list:
+) -> list[ProbeResult]:
     """Evaluate all probes and return detailed results."""
-    from context_policy.oracle.schema import Probe as ProbeType
-    from context_policy.oracle.schema import ProbeResult
-
     results: list[ProbeResult] = []
     for i, probe in enumerate(probes):
-        print(f"    Evaluating probe {i+1}/{len(probes)}: [{probe.category}] {probe.id}...")
+        print(f"    Evaluating probe {i+1}/{len(probes)}: {probe.id}...")
         try:
             result = evaluate_probe(
                 agents_md, probe, config.model, timeout_s=config.timeout_s,
             )
             results.append(result)
-            status = f"{result.pass_rate:.0%}"
-            print(f"      → {status}")
+            missing = sum(1 for r in result.behavior_reviews if r.assessment == "missing")
+            partial = sum(1 for r in result.behavior_reviews if r.assessment == "partial")
+            print(
+                f"      → reviews={len(result.behavior_reviews)} "
+                f"(missing={missing}, partial={partial}), "
+                f"edits={len(result.proposed_edits)}"
+            )
         except Exception as exc:
             print(f"      → ERROR: {exc}")
-            results.append(ProbeResult(
-                probe_id=probe.id,
-                category=probe.category,
-                verdicts=[],
-                pass_rate=0.0,
-            ))
+            results.append(
+                ProbeResult(
+                    probe_id=probe.id,
+                    task=probe.task,
+                    response="",
+                    behavior_reviews=[],
+                    proposed_edits=[],
+                    overall_notes=f"evaluation_error: {exc}",
+                )
+            )
     return results
+
+
+def _collect_edits_from_results(results: list[ProbeResult]) -> list[Edit]:
+    edits: list[Edit] = []
+    for result in results:
+        edits.extend(result.proposed_edits)
+    return edits
+
+
+def _dedupe_edits(edits: list[Edit]) -> list[Edit]:
+    seen: set[tuple[str, str, str]] = set()
+    out: list[Edit] = []
+    for edit in edits:
+        key = (edit.section.strip(), edit.action.strip().lower(), edit.content.strip())
+        if not key[2]:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            Edit(
+                section=key[0] or "General",
+                action=key[1] or "add",
+                content=key[2],
+            )
+        )
+    return out
 
 
 def _save_probe_results_summary(probe_results, path: Path) -> None:

@@ -67,13 +67,24 @@ def _normalize_image_tag(image: str | None) -> str | None:
     return image
 
 
-def _resolve_instance_image(instance: dict, local_images: list[str]) -> str | None:
+def _derive_image_from_instance_id(instance_id: str) -> str | None:
+    """Derive SWE-bench image from instance_id using observed naming convention."""
+    if "__" not in instance_id:
+        return None
+    repo, short = instance_id.split("__", 1)
+    if not repo or not short:
+        return None
+    return f"swebench/sweb.eval.x86_64.{repo}_1776_{short}:latest"
+
+
+def _resolve_instance_image(instance: dict, local_images: list[str]) -> tuple[str | None, str]:
     """Resolve expected image name for a SWE-bench instance.
 
     Priority:
     1) swebench.harness.docker_utils.get_instance_docker_image
     2) swebench.harness.test_spec.make_test_spec(...).instance_image_key
-    3) fallback search in local images by short instance id
+    3) derive from instance_id naming convention
+    4) fallback search in local images by short instance id
     """
     instance_id = instance["instance_id"]
 
@@ -82,7 +93,7 @@ def _resolve_instance_image(instance: dict, local_images: list[str]) -> str | No
 
         image = _normalize_image_tag(get_instance_docker_image(instance))
         if image:
-            return image
+            return image, "helper:get_instance_docker_image"
     except Exception:
         pass
 
@@ -92,21 +103,32 @@ def _resolve_instance_image(instance: dict, local_images: list[str]) -> str | No
         spec = make_test_spec(instance)
         image = _normalize_image_tag(getattr(spec, "instance_image_key", None))
         if image:
-            return image
+            return image, "helper:make_test_spec.instance_image_key"
     except Exception:
         pass
 
-    return _fallback_image_from_local(instance_id, local_images)
+    derived = _derive_image_from_instance_id(instance_id)
+    if derived:
+        return derived, "derived:instance_id"
+
+    fallback = _fallback_image_from_local(instance_id, local_images)
+    if fallback:
+        return fallback, "fallback:local_image_scan"
+
+    return None, "unresolved"
 
 
-def _resolve_images(instances: list[dict]) -> dict[str, str | None]:
-    """Resolve image names for all instances."""
+def _resolve_images(instances: list[dict]) -> tuple[dict[str, str | None], dict[str, str]]:
+    """Resolve image names and methods for all instances."""
     local_images = _list_local_images()
-    mapping: dict[str, str | None] = {}
+    image_mapping: dict[str, str | None] = {}
+    method_mapping: dict[str, str] = {}
     for inst in instances:
         iid = inst["instance_id"]
-        mapping[iid] = _resolve_instance_image(inst, local_images)
-    return mapping
+        image, method = _resolve_instance_image(inst, local_images)
+        image_mapping[iid] = image
+        method_mapping[iid] = method
+    return image_mapping, method_mapping
 
 
 def _pull_image(image: str) -> bool:
@@ -168,14 +190,13 @@ def main() -> int:
         return 1
 
     print("Resolving expected image names...")
-    resolved = _resolve_images(instances)
-
-    unresolved = [iid for iid, img in resolved.items() if not img]
-    if unresolved:
-        print("ERROR: Could not resolve image names for instance(s):")
-        for iid in unresolved:
-            print(f"  - {iid}")
-        return 1
+    resolved, resolve_methods = _resolve_images(instances)
+    print("Resolution methods:")
+    for inst in instances:
+        iid = inst["instance_id"]
+        image = resolved[iid] or "UNRESOLVED"
+        method = resolve_methods.get(iid, "unknown")
+        print(f"  - {iid}: {method} -> {image}")
 
     to_pull: list[tuple[str, str]] = []
     already_present: list[tuple[str, str]] = []

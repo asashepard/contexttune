@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""Build SWE-bench Docker images for a set of instances.
+"""Ensure SWE-bench Docker images exist for a set of instances.
 
-This pre-builds the Docker images that mini-swe-agent needs, so actual
-inference runs don't spend time on image construction.
-
-Usage:
-    python scripts/build_docker_images.py --instance_ids_file scripts/smoke_3_ids.txt
-    python scripts/build_docker_images.py --instance_ids_file scripts/verified_mini_ids.txt
+Deterministic flow:
+1) Resolve expected image name per instance via SWE-bench helpers.
+2) Pull missing images (or repull when --force is set).
+3) Verify each required image with `docker image inspect`.
 """
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -22,38 +17,113 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from context_policy.datasets.swebench import load_instances, read_instance_ids
 
 
-def _images_exist(instance_ids: list[str]) -> dict[str, str | None]:
-    """Check which SWE-bench Docker images already exist locally.
-
-    Returns a dict mapping instance_id -> image name (or None if missing).
-    """
+def _list_local_images() -> list[str]:
+    """Return locally available Docker images as repo:tag strings."""
     try:
         result = subprocess.run(
             ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=30,
         )
-        all_images = result.stdout.strip().splitlines() if result.returncode == 0 else []
+        if result.returncode == 0:
+            return [line.strip() for line in result.stdout.splitlines() if line.strip()]
     except Exception:
-        all_images = []
+        pass
+    return []
 
+
+def _docker_image_exists(image: str) -> bool:
+    """Check whether a specific Docker image exists locally."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _fallback_image_from_local(instance_id: str, local_images: list[str]) -> str | None:
+    """Fallback image resolution by matching short instance ID in local images."""
+    short_id = instance_id.split("__")[-1]
+    for img in local_images:
+        if short_id in img and "sweb.eval" in img:
+            return img
+    return None
+
+
+def _normalize_image_tag(image: str | None) -> str | None:
+    if not image:
+        return None
+    image = image.strip()
+    if not image:
+        return None
+    if ":" not in image.rsplit("/", 1)[-1]:
+        return f"{image}:latest"
+    return image
+
+
+def _resolve_instance_image(instance: dict, local_images: list[str]) -> str | None:
+    """Resolve expected image name for a SWE-bench instance.
+
+    Priority:
+    1) swebench.harness.docker_utils.get_instance_docker_image
+    2) swebench.harness.test_spec.make_test_spec(...).instance_image_key
+    3) fallback search in local images by short instance id
+    """
+    instance_id = instance["instance_id"]
+
+    try:
+        from swebench.harness.docker_utils import get_instance_docker_image
+
+        image = _normalize_image_tag(get_instance_docker_image(instance))
+        if image:
+            return image
+    except Exception:
+        pass
+
+    try:
+        from swebench.harness.test_spec import make_test_spec
+
+        spec = make_test_spec(instance)
+        image = _normalize_image_tag(getattr(spec, "instance_image_key", None))
+        if image:
+            return image
+    except Exception:
+        pass
+
+    return _fallback_image_from_local(instance_id, local_images)
+
+
+def _resolve_images(instances: list[dict]) -> dict[str, str | None]:
+    """Resolve image names for all instances."""
+    local_images = _list_local_images()
     mapping: dict[str, str | None] = {}
-    for iid in instance_ids:
-        short_id = iid.split("__")[-1]  # e.g. "django-10097"
-        found = None
-        for img in all_images:
-            if short_id in img and "sweb.eval" in img:
-                found = img
-                break
-        mapping[iid] = found
+    for inst in instances:
+        iid = inst["instance_id"]
+        mapping[iid] = _resolve_instance_image(inst, local_images)
     return mapping
+
+
+def _pull_image(image: str) -> bool:
+    """Pull image from registry."""
+    print(f"  Pulling: {image}")
+    try:
+        result = subprocess.run(["docker", "pull", image])
+        return result.returncode == 0
+    except Exception as exc:
+        print(f"  ERROR pull {image}: {exc}")
+        return False
 
 
 def main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Build SWE-bench Docker images.")
+    parser = argparse.ArgumentParser(description="Ensure SWE-bench Docker images exist.")
     parser.add_argument(
         "--instance_ids_file",
         required=True,
@@ -72,111 +142,96 @@ def main() -> int:
         "--max_workers",
         type=int,
         default=1,
-        help="Parallel workers for image building (default: 1).",
+        help="Unused for now; kept for CLI compatibility.",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Rebuild images even if they already exist.",
+        help="Repull images even if they already exist locally.",
     )
     args = parser.parse_args()
 
-    # Load instance IDs
     instance_ids = read_instance_ids(args.instance_ids_file)
     if not instance_ids:
         print("No instance IDs found.")
         return 1
     print(f"Loaded {len(instance_ids)} instance IDs from {args.instance_ids_file}")
 
-    # Check which images already exist
-    if not args.force:
-        existing = _images_exist(instance_ids)
-        missing = [iid for iid, img in existing.items() if img is None]
-        present = [iid for iid, img in existing.items() if img is not None]
-        if present:
-            print(f"Already built: {len(present)} images")
-            for iid in present:
-                print(f"  ✓ {iid} -> {existing[iid]}")
-        if not missing:
-            print("All images exist. Use --force to rebuild.")
-            return 0
-        print(f"Need to build: {len(missing)} images")
-        build_ids = missing
-    else:
-        build_ids = instance_ids
-
-    # Load full instance data (needed by swebench harness)
     print("Loading instance data from dataset...")
     instances = load_instances(
         dataset_name=args.dataset_name,
         split=args.split,
-        instance_ids=build_ids,
+        instance_ids=instance_ids,
     )
+    if not instances:
+        print("No matching instances found in dataset.")
+        return 1
 
-    # Write dummy predictions JSONL (non-empty patch to force image build)
-    dummy_patch = "--- a/dummy.txt\n+++ b/dummy.txt\n@@ -0,0 +1 @@\n+dummy\n"
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
-    ) as f:
-        for inst in instances:
-            record = {
-                "instance_id": inst["instance_id"],
-                "model_name_or_path": "dummy",
-                "model_patch": dummy_patch,
-            }
-            f.write(json.dumps(record) + "\n")
-        preds_path = f.name
+    print("Resolving expected image names...")
+    resolved = _resolve_images(instances)
 
-    run_id = datetime.now(timezone.utc).strftime("image_build_%Y%m%d_%H%M%S")
+    unresolved = [iid for iid, img in resolved.items() if not img]
+    if unresolved:
+        print("ERROR: Could not resolve image names for instance(s):")
+        for iid in unresolved:
+            print(f"  - {iid}")
+        return 1
 
-    print(f"Building {len(instances)} Docker images...")
-    print(f"  Dummy predictions: {preds_path}")
-    print(f"  Run ID: {run_id}")
-    print(f"  Workers: {args.max_workers}")
-    print()
+    to_pull: list[tuple[str, str]] = []
+    already_present: list[tuple[str, str]] = []
+    for inst in instances:
+        iid = inst["instance_id"]
+        image = resolved[iid]
+        if image is None:
+            continue
+        exists = _docker_image_exists(image)
+        if args.force or not exists:
+            to_pull.append((iid, image))
+        else:
+            already_present.append((iid, image))
 
-    # Run swebench harness to build images.
-    # Use a unique run_id and no cache retention so image building cannot be
-    # skipped due to prior evaluation cache artifacts.
-    cmd = [
-        sys.executable, "-m", "swebench.harness.run_evaluation",
-        "--dataset_name", args.dataset_name,
-        "--predictions_path", preds_path,
-        "--run_id", run_id,
-        "--max_workers", str(args.max_workers),
-        "--cache_level", "none",
-    ]
+    if already_present:
+        print(f"Already present: {len(already_present)} images")
+        for iid, image in already_present:
+            print(f"  ✓ {iid} -> {image}")
 
-    # Only force rebuild when explicitly requested.
-    # When forcing, set namespace to "none" to avoid the harness conflict:
-    # "Cannot force rebuild and use a namespace at the same time."
-    if args.force:
-        cmd.extend(["--force_rebuild", "true", "--namespace", "none"])
+    if to_pull:
+        print(f"Pulling {len(to_pull)} image(s)...")
+        pull_failures: list[tuple[str, str]] = []
+        for iid, image in to_pull:
+            ok = _pull_image(image)
+            if not ok:
+                pull_failures.append((iid, image))
 
-    print(f"CMD: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
+        if pull_failures:
+            print("\nWARNING: Pull failed for some images:")
+            for iid, image in pull_failures:
+                print(f"  ✗ {iid} -> {image}")
+    else:
+        print("All required images are already present. Use --force to repull.")
 
-    # Clean up temp file
-    try:
-        Path(preds_path).unlink()
-    except OSError:
-        pass
-
-    # Verify images were built
-    print()
-    print("Verifying images...")
-    final = _images_exist(build_ids)
+    print("\nVerifying required images...")
     ok = 0
     fail = 0
-    for iid, img in final.items():
-        if img:
-            print(f"  ✓ {iid} -> {img}")
+    missing_details: list[tuple[str, str]] = []
+    for inst in instances:
+        iid = inst["instance_id"]
+        image = resolved[iid]
+        if image and _docker_image_exists(image):
+            print(f"  ✓ {iid} -> {image}")
             ok += 1
         else:
-            print(f"  ✗ {iid} -> NOT FOUND")
+            missing_image = image or "UNRESOLVED"
+            print(f"  ✗ {iid} -> {missing_image}")
+            missing_details.append((iid, missing_image))
             fail += 1
 
-    print(f"\nResult: {ok} built, {fail} missing")
+    print(f"\nResult: {ok} present, {fail} missing")
+    if fail:
+        print("Missing required images:")
+        for iid, image in missing_details:
+            print(f"  - {iid} -> {image}")
+
     return 0 if fail == 0 else 1
 
 

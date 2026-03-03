@@ -113,16 +113,16 @@ fi
 if [[ -n "$IDS_FILE" ]]; then
     section "Step 4.5/6: Repo restriction preview"
     log "Computing repos represented by IDS_FILE (pre-run confirmation)"
-    run_cmd python -u - <<'PY'
-import os
+    run_cmd python -u - "$DATASET_NAME" "$IDS_FILE" "$REPO_CONFIG" <<'PY'
 import json
+import sys
 from pathlib import Path
 from context_policy.datasets.swebench import load_instances, read_instance_ids
 
-dataset_name = os.environ["DATASET_NAME"]
+dataset_name = sys.argv[1]
 split = "test"
-ids_file = os.environ["IDS_FILE"]
-repo_config = os.environ["REPO_CONFIG"]
+ids_file = sys.argv[2]
+repo_config = sys.argv[3]
 
 ids = read_instance_ids(ids_file)
 instances = load_instances(dataset_name=dataset_name, split=split, instance_ids=ids)

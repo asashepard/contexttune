@@ -10,9 +10,12 @@ agent:
     Use that single bash block to run the next command.
     Each response must contain a single command (or a command chain with && / ||).
     Never run the same command twice in a row. If output does not help, choose a different command.
+    If a command fails (non-zero exit), do not repeat it unchanged.
+    Diagnose and use a different method on the next step.
     By step 5, you must attempt a code change using a non-interactive edit command
     (for example: python - <<'PY' ..., apply_patch, sed, or perl).
-    After any edit, run git diff (or git status --porcelain) to confirm changes.
+    Prefer direct file edits or diff-based edits over complex sed regex rewrites.
+    After any edit, run git diff --stat (or git status --porcelain) to confirm changes.
     If you get stuck, run rg -n "URLValidator|validators.py" (or a similar targeted search)
     and then make the minimal edit to the auth regex.
     Keep edits focused and minimal.

@@ -267,6 +267,15 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
         empty_patch_count = 0
         missing_image_count = 0
         error_count = 0
+        fallback_single_shot_used_count = 0
+        fallback_single_shot_success_count = 0
+        stalled_repeat_failure_count = 0
+        patch_source_counts: dict[str, int] = {
+            "container": 0,
+            "model": 0,
+            "fallback_single_shot": 0,
+            "empty": 0,
+        }
         elapsed_s = 0.0
         token_usage = {
             "prompt_tokens": 0,
@@ -294,10 +303,24 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
                     error_count += 1
                 elif not patch_non_empty_i:
                     empty_patch_count += 1
+
+                if bool(metric.get("fallback_single_shot_used", False)):
+                    fallback_single_shot_used_count += 1
+                if int(metric.get("fallback_single_shot_patch_len", 0) or 0) > 0:
+                    fallback_single_shot_success_count += 1
+                if str(metric.get("stall_type", "") or "") == "repeat_failed_action":
+                    stalled_repeat_failure_count += 1
+
+                patch_source = str(metric.get("patch_source", "") or "")
+                if patch_source in patch_source_counts:
+                    patch_source_counts[patch_source] += 1
+                elif patch_source:
+                    patch_source_counts[patch_source] = patch_source_counts.get(patch_source, 0) + 1
             else:
                 patch_non_empty_i = bool(patch_text and str(patch_text).strip())
                 if not patch_non_empty_i:
                     empty_patch_count += 1
+                patch_source_counts["model" if patch_non_empty_i else "empty"] += 1
 
             if patch_non_empty_i:
                 patch_non_empty += 1
@@ -310,6 +333,10 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
             "empty_patch_count": empty_patch_count,
             "missing_image_count": missing_image_count,
             "error_count": error_count,
+            "fallback_single_shot_used_count": fallback_single_shot_used_count,
+            "fallback_single_shot_success_count": fallback_single_shot_success_count,
+            "stalled_repeat_failure_count": stalled_repeat_failure_count,
+            "patch_source_counts": patch_source_counts,
             "elapsed_s": elapsed_s,
             "mean_elapsed_s": (elapsed_s / attempted) if attempted else 0.0,
             "token_usage": token_usage,
@@ -410,6 +437,16 @@ def run_experiment(config: ExperimentConfig, *, dry_run: bool = False) -> Path:
                     "patch_non_empty": bool(patch and patch.strip()),
                     "status": run_meta.get("status", "ok"),
                     "error": run_meta.get("error"),
+                    "patch_source": run_meta.get("patch_source", "empty"),
+                    "fallback_single_shot_used": bool(run_meta.get("fallback_single_shot_used", False)),
+                    "fallback_single_shot_patch_len": int(run_meta.get("fallback_single_shot_patch_len", 0) or 0),
+                    "fallback_single_shot_raw_len": int(run_meta.get("fallback_single_shot_raw_len", 0) or 0),
+                    "fallback_reason": run_meta.get("fallback_reason"),
+                    "fallback_single_shot_truncated": bool(run_meta.get("fallback_single_shot_truncated", False)),
+                    "stall_detected": bool(run_meta.get("stall_detected", False)),
+                    "stall_type": run_meta.get("stall_type"),
+                    "stall_action": run_meta.get("stall_action"),
+                    "stall_repeat_count": int(run_meta.get("stall_repeat_count", 0) or 0),
                     "token_usage": {
                         "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
                         "completion_tokens": int(usage.get("completion_tokens", 0) or 0),

@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import queue
+import re
 import subprocess
 import tempfile
 import time
@@ -25,6 +26,7 @@ from context_policy.runner.patch_utils import (
     extract_diff,
     sanitize_patch_for_preds,
 )
+from context_policy.llm.openai_compat import chat_completion
 
 # Default step limit to prevent the agent from looping indefinitely.
 # Experiment spec v1.1 uses 30 steps.
@@ -33,6 +35,7 @@ DEFAULT_AGENT_MAX_TOKENS = 1024
 DEFAULT_CONTEXT_WINDOW_TOKENS = 19968
 DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS = 512
 DEFAULT_CONTEXT_BOUNDARY_BUFFER_TOKENS = 32
+DEFAULT_FALLBACK_MAX_TOKENS = 1024
 
 
 def _first_nonempty_env(*keys: str) -> str | None:
@@ -215,6 +218,156 @@ def _read_traj_token_usage(traj_path: Path) -> dict[str, int]:
             "total_tokens": 0,
         }
     return _extract_token_usage_from_any(data)
+
+
+def _read_traj_data(traj_path: Path | None) -> dict[str, Any]:
+    if traj_path is None or not traj_path.exists():
+        return {}
+    try:
+        data = json.loads(traj_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _detect_repeated_failed_action(traj_data: dict[str, Any]) -> tuple[bool, str | None, int]:
+    """Detect repeated failed identical command attempts from saved messages/history."""
+    messages = traj_data.get("messages")
+    if not isinstance(messages, list):
+        return False, None, 0
+
+    attempts: list[tuple[str, bool]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            command = None
+            for key in ("command", "cmd", "action"):
+                value = node.get(key)
+                if isinstance(value, str) and value.strip():
+                    command = value.strip()
+                    break
+
+            failed = False
+            for key in ("returncode", "exit_code", "exitCode", "status_code"):
+                if key in node:
+                    try:
+                        failed = int(node.get(key, 0) or 0) != 0
+                    except Exception:
+                        failed = False
+                    break
+
+            if command is not None:
+                attempts.append((command, failed))
+
+            content = node.get("content")
+            if isinstance(content, str):
+                cmd_match = re.search(r"(?im)^\s*(?:command|cmd)\s*:\s*(.+)$", content)
+                rc_match = re.search(r"(?im)^\s*(?:returncode|exit[_ ]?code)\s*[:=]\s*(\d+)", content)
+                if cmd_match:
+                    command = cmd_match.group(1).strip()
+                    failed = bool(rc_match and int(rc_match.group(1)) != 0)
+                    attempts.append((command, failed))
+
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(messages)
+
+    best_action = None
+    best_count = 0
+    current_action = None
+    current_count = 0
+
+    for command, failed in attempts:
+        if not failed:
+            current_action = None
+            current_count = 0
+            continue
+        if command == current_action:
+            current_count += 1
+        else:
+            current_action = command
+            current_count = 1
+        if current_count > best_count:
+            best_count = current_count
+            best_action = command
+
+    if best_action and best_count >= 3:
+        return True, best_action, best_count
+    return False, best_action, best_count
+
+
+def _fallback_single_shot_patch(
+    *,
+    model: str,
+    instance: dict,
+    context_md: str | None,
+    max_tokens: int = DEFAULT_FALLBACK_MAX_TOKENS,
+    timeout_s: int = 120,
+) -> dict[str, Any]:
+    """Single-shot fallback patch generation for stalled/empty interactive runs."""
+    request_model = model
+    hosted_prefix = "hosted_vllm/"
+    if request_model.startswith(hosted_prefix):
+        stripped = request_model[len(hosted_prefix):].strip()
+        if stripped:
+            request_model = stripped
+
+    repo = str(instance.get("repo", ""))
+    instance_id = str(instance.get("instance_id", ""))
+    problem_statement = str(instance.get("problem_statement", "")).strip()
+    context_hint = (context_md or "").strip()
+    if len(context_hint) > 2000:
+        context_hint = context_hint[:2000]
+
+    system_prompt = (
+        "Return ONLY a valid unified git diff. "
+        "Start with 'diff --git'. "
+        "No markdown fences. No explanation."
+    )
+    user_prompt = (
+        f"Repository: {repo}\n"
+        f"Instance: {instance_id}\n"
+        f"Issue:\n{problem_statement}\n\n"
+        "If needed, make a minimal plausible fix patch for this issue.\n"
+        "Output only unified diff text."
+    )
+    if context_hint:
+        user_prompt += f"\n\nOptional guidance hint:\n{context_hint}"
+
+    raw = ""
+    error = None
+    try:
+        raw = chat_completion(
+            model=request_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=max_tokens,
+            timeout_s=max(30, timeout_s),
+        )
+    except Exception as exc:
+        error = str(exc)
+
+    extracted = extract_diff(raw or "")
+    sanitized, is_noop = sanitize_patch_for_preds(extracted)
+    truncated = bool(raw) and not raw.endswith("\n")
+    return {
+        "patch": sanitized,
+        "raw_len": len(raw or ""),
+        "patch_len": len(sanitized or ""),
+        "used": True,
+        "success": bool(sanitized),
+        "no_op": bool(is_noop),
+        "truncated": truncated,
+        "error": error,
+    }
 
 
 def _docker_image_exists(image_name: str) -> bool:
@@ -762,6 +915,16 @@ def generate_patch_with_mini_swebench_result(
       - status: one of ok, timeout, error, missing_image
       - error: optional error message
       - trajectory_path: optional saved trajectory path
+            - patch_source: container|model|fallback_single_shot|empty
+            - fallback_single_shot_used: bool
+            - fallback_single_shot_patch_len: int
+            - fallback_single_shot_raw_len: int
+            - fallback_reason: optional reason string
+            - fallback_single_shot_truncated: bool
+            - stall_detected: bool
+            - stall_type: optional stall label
+            - stall_action: optional repeated command string
+            - stall_repeat_count: int
     """
     started = time.perf_counter()
     traj_path: Path | None = None
@@ -798,6 +961,16 @@ def generate_patch_with_mini_swebench_result(
             "status": "missing_image",
             "error": f"missing_docker_image:{image_name}",
             "trajectory_path": None,
+            "patch_source": "empty",
+            "fallback_single_shot_used": False,
+            "fallback_single_shot_patch_len": 0,
+            "fallback_single_shot_raw_len": 0,
+            "fallback_reason": None,
+            "fallback_single_shot_truncated": False,
+            "stall_detected": False,
+            "stall_type": None,
+            "stall_action": None,
+            "stall_repeat_count": 0,
         }
 
     # Build task with context, trimming context block if needed to preserve
@@ -858,6 +1031,15 @@ def generate_patch_with_mini_swebench_result(
         traj_file.close()
 
     trajectory_path_value = str(traj_path) if traj_path is not None else None
+    fallback_single_shot_used = False
+    fallback_single_shot_patch_len = 0
+    fallback_single_shot_raw_len = 0
+    fallback_reason = None
+    fallback_single_shot_truncated = False
+    stall_detected = False
+    stall_type = None
+    stall_action = None
+    stall_repeat_count = 0
 
     try:
         # Run agent in separate process for timeout enforcement
@@ -903,6 +1085,16 @@ def generate_patch_with_mini_swebench_result(
                     "status": "timeout",
                     "error": f"timeout:{timeout_s}",
                     "trajectory_path": trajectory_path_value,
+                    "patch_source": "container" if sanitized_patch else "empty",
+                    "fallback_single_shot_used": fallback_single_shot_used,
+                    "fallback_single_shot_patch_len": fallback_single_shot_patch_len,
+                    "fallback_single_shot_raw_len": fallback_single_shot_raw_len,
+                    "fallback_reason": fallback_reason,
+                    "fallback_single_shot_truncated": fallback_single_shot_truncated,
+                    "stall_detected": stall_detected,
+                    "stall_type": stall_type,
+                    "stall_action": stall_action,
+                    "stall_repeat_count": stall_repeat_count,
                 }
 
             # Fall back to trajectory / queue
@@ -918,6 +1110,16 @@ def generate_patch_with_mini_swebench_result(
                 "status": "timeout",
                 "error": f"timeout:{timeout_s}",
                 "trajectory_path": trajectory_path_value,
+                "patch_source": "model" if salvage else "empty",
+                "fallback_single_shot_used": fallback_single_shot_used,
+                "fallback_single_shot_patch_len": fallback_single_shot_patch_len,
+                "fallback_single_shot_raw_len": fallback_single_shot_raw_len,
+                "fallback_reason": fallback_reason,
+                "fallback_single_shot_truncated": fallback_single_shot_truncated,
+                "stall_detected": stall_detected,
+                "stall_type": stall_type,
+                "stall_action": stall_action,
+                "stall_repeat_count": stall_repeat_count,
             }
 
         # Get result from queue (use .get with timeout, not .empty() which is unreliable)
@@ -938,6 +1140,16 @@ def generate_patch_with_mini_swebench_result(
                 "status": "error",
                 "error": "no_result_in_queue",
                 "trajectory_path": trajectory_path_value,
+                "patch_source": "model" if salvage else "empty",
+                "fallback_single_shot_used": fallback_single_shot_used,
+                "fallback_single_shot_patch_len": fallback_single_shot_patch_len,
+                "fallback_single_shot_raw_len": fallback_single_shot_raw_len,
+                "fallback_reason": fallback_reason,
+                "fallback_single_shot_truncated": fallback_single_shot_truncated,
+                "stall_detected": stall_detected,
+                "stall_type": stall_type,
+                "stall_action": stall_action,
+                "stall_repeat_count": stall_repeat_count,
             }
 
         if error:
@@ -955,7 +1167,25 @@ def generate_patch_with_mini_swebench_result(
                 "status": "error",
                 "error": error,
                 "trajectory_path": trajectory_path_value,
+                "patch_source": "model" if salvage else "empty",
+                "fallback_single_shot_used": fallback_single_shot_used,
+                "fallback_single_shot_patch_len": fallback_single_shot_patch_len,
+                "fallback_single_shot_raw_len": fallback_single_shot_raw_len,
+                "fallback_reason": fallback_reason,
+                "fallback_single_shot_truncated": fallback_single_shot_truncated,
+                "stall_detected": stall_detected,
+                "stall_type": stall_type,
+                "stall_action": stall_action,
+                "stall_repeat_count": stall_repeat_count,
             }
+
+        traj_data = _read_traj_data(traj_path)
+        result_label = str(traj_data.get("result_label", "") or "")
+        patch_source = str(traj_data.get("patch_source", "") or "")
+
+        stall_detected, stall_action, stall_repeat_count = _detect_repeated_failed_action(traj_data)
+        if stall_detected:
+            stall_type = "repeat_failed_action"
 
         sanitized_patch, is_noop = sanitize_patch_for_preds(patch or "")
         if sanitized_patch != (patch or ""):
@@ -964,6 +1194,33 @@ def generate_patch_with_mini_swebench_result(
                 f"sanitized_patch_len={len(sanitized_patch)}, no_op={is_noop}"
             )
         patch = sanitized_patch
+
+        if not patch_source:
+            patch_source = "model" if patch else "empty"
+
+        if (not patch) and result_label == "LimitsExceeded":
+            fallback_single_shot_used = True
+            fallback_reason = "limits_exceeded_no_diff"
+            if stall_detected:
+                fallback_reason = "limits_exceeded_no_diff_stalled_repeat_failure"
+            fallback = _fallback_single_shot_patch(
+                model=model,
+                instance=instance,
+                context_md=trimmed_context,
+                max_tokens=DEFAULT_FALLBACK_MAX_TOKENS,
+                timeout_s=min(180, timeout_s),
+            )
+            fallback_single_shot_patch_len = int(fallback.get("patch_len", 0) or 0)
+            fallback_single_shot_raw_len = int(fallback.get("raw_len", 0) or 0)
+            fallback_single_shot_truncated = bool(fallback.get("truncated", False))
+            patch = str(fallback.get("patch", "") or "")
+            patch_source = "fallback_single_shot" if patch else "empty"
+            print(
+                "  Fallback single-shot: "
+                f"used={fallback_single_shot_used}, reason={fallback_reason}, "
+                f"raw_len={fallback_single_shot_raw_len}, patch_len={fallback_single_shot_patch_len}, "
+                f"truncated={fallback_single_shot_truncated}, success={bool(patch)}"
+            )
 
         # Safety: reject oversized patches
         if patch and len(patch) > MAX_PATCH_SIZE:
@@ -975,6 +1232,16 @@ def generate_patch_with_mini_swebench_result(
                 "status": "error",
                 "error": "patch_too_large",
                 "trajectory_path": trajectory_path_value,
+                "patch_source": "empty",
+                "fallback_single_shot_used": fallback_single_shot_used,
+                "fallback_single_shot_patch_len": fallback_single_shot_patch_len,
+                "fallback_single_shot_raw_len": fallback_single_shot_raw_len,
+                "fallback_reason": fallback_reason,
+                "fallback_single_shot_truncated": fallback_single_shot_truncated,
+                "stall_detected": stall_detected,
+                "stall_type": stall_type,
+                "stall_action": stall_action,
+                "stall_repeat_count": stall_repeat_count,
             }
 
         return {
@@ -984,6 +1251,16 @@ def generate_patch_with_mini_swebench_result(
             "status": "ok",
             "error": None,
             "trajectory_path": trajectory_path_value,
+            "patch_source": patch_source,
+            "fallback_single_shot_used": fallback_single_shot_used,
+            "fallback_single_shot_patch_len": fallback_single_shot_patch_len,
+            "fallback_single_shot_raw_len": fallback_single_shot_raw_len,
+            "fallback_reason": fallback_reason,
+            "fallback_single_shot_truncated": fallback_single_shot_truncated,
+            "stall_detected": stall_detected,
+            "stall_type": stall_type,
+            "stall_action": stall_action,
+            "stall_repeat_count": stall_repeat_count,
         }
 
     except Exception as e:
@@ -995,6 +1272,16 @@ def generate_patch_with_mini_swebench_result(
             "status": "error",
             "error": str(e),
             "trajectory_path": trajectory_path_value,
+            "patch_source": "empty",
+            "fallback_single_shot_used": fallback_single_shot_used,
+            "fallback_single_shot_patch_len": fallback_single_shot_patch_len,
+            "fallback_single_shot_raw_len": fallback_single_shot_raw_len,
+            "fallback_reason": fallback_reason,
+            "fallback_single_shot_truncated": fallback_single_shot_truncated,
+            "stall_detected": stall_detected,
+            "stall_type": stall_type,
+            "stall_action": stall_action,
+            "stall_repeat_count": stall_repeat_count,
         }
     finally:
         # Clean up temp trajectory file if we created one (keep when traj_dir is set)

@@ -435,13 +435,23 @@ def _run_agent_in_docker(
         from minisweagent.environments.docker import DockerEnvironment
         from minisweagent.models.litellm_model import LitellmModel
 
-        # ---- Load SWE-bench config shipped with mini-swe-agent ----
-        # This config contains the prompts that instruct the agent to edit
-        # files in /testbed and submit with `git add -A && git diff --cached`.
-        # Without it, the agent uses bare defaults that don't produce patches.
+        # ---- Load SWE-bench config (env override or mini-swe-agent default) ----
+        # This config contains prompt templates and environment settings.
         swebench_config: dict = {}
         try:
-            cfg_path = get_config_path("swebench")
+            cfg_override = os.environ.get("MSWEA_SWEBENCH_CONFIG", "").strip()
+            if cfg_override:
+                override_path = Path(cfg_override)
+                if override_path.exists():
+                    cfg_path = override_path
+                else:
+                    print(
+                        "  WARNING: MSWEA_SWEBENCH_CONFIG is set but file does not exist: "
+                        f"{override_path}; falling back to built-in swebench config"
+                    )
+                    cfg_path = get_config_path("swebench")
+            else:
+                cfg_path = get_config_path("swebench")
             swebench_config = yaml.safe_load(cfg_path.read_text()) or {}
             print(f"  Loaded SWE-bench config from {cfg_path}")
         except Exception as exc:
